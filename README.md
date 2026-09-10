@@ -29,22 +29,49 @@ audio → text
 from isolated-word recordings today, and from sentence recordings in the future.
 The numeric audio ID is only an identifier — it is **never** used as a class label.
 
-## 2. Dataset structure
+## 2. Where to put your data
+
+The project expects **two things** under `data/`: your raw recordings (the
+source of truth) and the derived manifest (created automatically).
 
 ```
-data/
-└── raw/
-    ├── index.txt
-    └── assets/
-        ├── 1.opus
-        ├── 2.opus
-        └── ...
+neural-speech/
+├── data/
+│   ├── raw/                    # ← YOU create this (from your recordings)
+│   │   ├── index.txt           # ← YOU create this (word → audio ID map)
+│   │   └── assets/             # ← YOU create this (the .opus recordings)
+│   │       ├── 1.opus
+│   │       ├── 2.opus
+│   │       ├── 3.opus
+│   │       └── ...
+│   └── processed/              # ← generated; do not edit by hand
+│       └── manifest.csv        #   created by prepare; splits stored here too
+├── checkpoints/                # ← generated when you train (v001, v002, …)
+├── src/                        # ← the code
+└── tests/                      # ← the tests
 ```
 
-## 3. Expected index.txt format
+### Step 1 — Put your audio files in `data/raw/assets/`
 
-`index.txt` groups words under `[section]` headers. Sections are organizational
-only and are **not** used as classes.
+Copy or move every recording there. Filenames are **numeric IDs** (one ID per
+audio file), the same extension as your recordings:
+
+```
+data/raw/assets/
+├── 1.opus
+├── 2.opus
+├── 3.opus
+└── ...
+```
+
+> `.opus` is what the project was built with, but any format soundfile/torchaudio
+> decodes works (WAV, FLAC, OGG, MP3). Keep the numeric ID filename scheme —
+> the filename number is what ties an audio file to its transcription.
+
+### Step 2 — Write `data/raw/index.txt`
+
+One line per audio file in the form `WORD = ID`, where `ID` is the filename
+number of the audio and `WORD` is its exact transcription.
 
 ```
 [ad]
@@ -54,13 +81,71 @@ adto = 83
 [ak]
 ako = 24
 akong = 35
+
+[am]
+amo = 44
 ```
 
-Meaning: `104.opus → "adlaw"`, `83.opus → "adto"`, ...
+Meaning:
 
-The original `index.txt` is immutable source data. It is never modified.
+| audio file      | text (transcription) |
+|-----------------|----------------------|
+| `104.opus`      | `adlaw`              |
+| `83.opus`       | `adto`               |
+| `24.opus`       | `ako`                |
+| `35.opus`       | `akong`              |
 
-## 4. Installation
+Rules for `index.txt`:
+
+- The `[ad]`, `[ak]`, `[am]` header lines are **optional organizational sections**
+  only. They are never used as model classes.
+- Blank lines are ignored.
+- Both sides of `=`: the word is the **exact text**, the number is the **audio ID**.
+- `index.txt` is **immutable source data** — the project never modifies it.
+
+### Step 3 — Generate the manifest (do this after adding audio)
+
+```powershell
+python -m src.data.prepare
+```
+
+This parses `index.txt` and writes the derived manifest
+`data/processed/manifest.csv`:
+
+```csv
+id,audio,text,section
+104,data/raw/assets/104.opus,adlaw,ad
+83,data/raw/assets/83.opus,adto,ad
+24,data/raw/assets/24.opus,ako,ak
+```
+
+Then validate everything (see section on validation below):
+
+```powershell
+python -m src.data.validate --fail-on-error
+```
+
+### Adding a second (incremental) dataset later
+
+Create a separate raw folder structure and manifests so you can train
+incrementally without touching the first dataset:
+
+```
+data/
+├── raw/
+│   ├── index.txt            # dataset v001 (untouched)
+│   └── assets/…
+└── processed/
+    ├── manifest_v001.csv    # prepared from index.txt
+    ├── manifest_v002.csv    # ← from your NEW data (index_v002.txt → new manifest)
+    └── …
+```
+
+```powershell
+python -m src.data.prepare --index data/raw/index_v002.txt --output data/processed/manifest_v002.csv
+```
+
+## 3. Installation
 
 ```powershell
 python -m venv .venv
@@ -80,25 +165,9 @@ Install torch with GPU support (optional, recommended for training):
 python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
-## 5. Dataset preparation
+## 4. Dataset validation
 
-Parse `index.txt` into a normalized manifest:
-
-```powershell
-python -m src.data.prepare
-# custom paths
-python -m src.data.prepare --index data/raw/index.txt --output data/processed/manifest.csv
-```
-
-Produces `data/processed/manifest.csv`:
-
-```csv
-id,audio,text,section
-104,data/raw/assets/104.opus,adlaw,ad
-83,data/raw/assets/83.opus,adto,ad
-```
-
-## 6. Dataset validation
+After preparing, check the dataset before training:
 
 ```powershell
 python -m src.data.validate
@@ -109,7 +178,17 @@ Checks: invalid index lines, duplicate IDs/paths, missing or corrupt audio,
 empty transcriptions, invalid text encoding, unexpected filenames, and prints a
 summary of valid/invalid counts.
 
-## 7. Initial training
+```
+Dataset validation
+------------------
+Total entries:       159
+Valid entries:       158
+Missing audio:       1
+Invalid entries:     0
+Duplicate IDs:       0
+```
+
+## 5. Initial training
 
 ```powershell
 python -m src.training.train \
@@ -120,7 +199,7 @@ python -m src.training.train \
 Outputs per epoch: `train_loss`, `val_loss`, `CER`, `WER`, and `lr`. Mixed
 precision (AMP) is used automatically when CUDA is available.
 
-## 8. Checkpoint structure
+## 6. Checkpoint structure
 
 ```
 checkpoints/
@@ -141,7 +220,7 @@ checkpoints/
 Checkpoints are **immutable versions** — a new training run always creates a new
 `vNNN` directory and never overwrites an old one.
 
-## 9. Resume training
+## 7. Resume training
 
 ```powershell
 python -m src.training.train \
@@ -152,7 +231,7 @@ python -m src.training.train \
 Restores model weights, optimizer state, scheduler state, vocabulary, config,
 epoch, step, and random state where practical, then continues.
 
-## 10. Incremental training
+## 8. Incremental training
 
 ```powershell
 python -m src.training.train \
@@ -165,7 +244,7 @@ Initializes from v001, trains on the new dataset, and produces a new version
 (e.g. v002). The parent is recorded in `training_state.json`, and the old
 checkpoint is never touched.
 
-## 11. Replay training (reducing catastrophic forgetting)
+## 9. Replay training (reducing catastrophic forgetting)
 
 ```powershell
 python -m src.training.train \
@@ -179,7 +258,7 @@ Mixes 30% samples from the previous dataset into every training epoch's stream,
 70% new data, to reduce catastrophic forgetting. Replay reduces but does not
 completely prevent forgetting.
 
-## 12. Evaluation / regression
+## 10. Evaluation / regression
 
 Every incremental run should be evaluated against both the new dataset and the
 old/reference dataset:
@@ -199,7 +278,7 @@ compare before/after:
 }
 ```
 
-## 13. Standalone inference
+## 11. Standalone inference
 
 ```powershell
 python -m src.inference.transcriber sample.opus --checkpoint checkpoints/latest
@@ -218,7 +297,7 @@ print(text)
 Inference uses the same audio preprocessing, vocabulary, and model config saved
 with the checkpoint — nothing is duplicated.
 
-## 14. FastAPI usage
+## 12. FastAPI usage
 
 Start the API (loads the model once at startup):
 
@@ -254,7 +333,7 @@ curl.exe -X POST http://localhost:8000/stt -F "file=@sample.opus"
 The API fails clearly at startup if the configured checkpoint does not exist.
 It is an **inference layer only** — training logic is not exposed.
 
-## 15. Deployment optimization
+## 13. Deployment optimization
 
 The checkpoint module ships deployment helpers to shrink/lower-latency the model:
 
@@ -277,7 +356,7 @@ python -m src.deploy.optimize --checkpoint checkpoints/latest --tensorrt --tenso
 On machines without TensorRT the step is skipped gracefully. For real latency
 budgets, benchmark float32 vs quantized vs ONNX in your serving environment.
 
-## 16. Future TTS architecture
+## 14. Future TTS architecture
 
 TTS can be added later without touching STT code, following this layout:
 
@@ -295,7 +374,7 @@ src/
         └── tts.py
 ```
 
-## 17. Tests
+## 15. Tests
 
 ```powershell
 python -m pytest tests -q
@@ -303,7 +382,7 @@ python -m pytest tests -q
 
 Tests use tiny synthetic audio samples and never require the full dataset.
 
-## 18. Key design rules
+## 16. Key design rules
 
 1. The numeric audio ID is an identifier, **not** a class label.
 2. The model learns `audio → text`, never `audio → ID`.
