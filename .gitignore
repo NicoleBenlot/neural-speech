@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.onnx
+checkpoints/*
+!checkpoints/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+_smoke/
+.DS_Store

@@ -1,0 +1,882 @@
+Build a complete Python project named neural-speech.
+
+The goal is to create an experimental custom neural speech system, initially focused on STT (speech-to-text), with the architecture prepared for TTS (text-to-speech) later.
+
+The project must support incremental/continued training. A trained model must be saved as a versioned checkpoint and later reused as the starting point for additional training on new datasets while retaining previously learned knowledge.
+
+Do not use a pretrained STT/TTS model as the core neural model. This project is intended to train an original experimental model from the user's own speech dataset.
+
+1. Current dataset
+
+The existing raw dataset has this structure:
+
+data/
+└── raw/
+    ├── index.txt
+    └── assets/
+        ├── 1.opus
+        ├── 2.opus
+        ├── 3.opus
+        └── ...
+
+
+The index.txt is grouped by prefixes and maps words to numeric audio IDs.
+
+Example:
+
+[ad]
+adlaw = 104
+adto = 83
+
+[ak]
+ako = 24
+akoa = 41
+akong = 35
+
+[am]
+amo = 44
+among = 38
+
+[an]
+ang = 1
+anhi = 84
+
+
+This means:
+
+104.opus → "adlaw"
+83.opus  → "adto"
+24.opus  → "ako"
+41.opus  → "akoa"
+35.opus  → "akong"
+
+
+The [ad], [ak], etc. sections are organizational metadata only and must not be treated as neural-network classes.
+
+The numeric ID identifies the audio file.
+
+The actual training relationship is:
+
+audio → transcription
+
+
+The current recordings are primarily isolated word recordings.
+
+Do not assume that the current dataset contains complete sentences.
+
+2. Dataset parser
+
+Create a parser for the existing index.txt format.
+
+The parser must:
+
+Ignore blank lines.
+Detect section headers such as [ad].
+Parse entries in the form word = integer.
+Preserve the exact word transcription.
+Extract the integer audio ID.
+Resolve the audio path as:
+data/raw/assets/<id>.opus
+
+
+For example:
+
+adlaw = 104
+
+
+becomes:
+
+{
+    "id": 104,
+    "audio_path": "data/raw/assets/104.opus",
+    "text": "adlaw"
+}
+
+
+The section name should be preserved as optional metadata but must not be required by the model.
+
+Do not modify the original index.txt.
+
+3. Processed manifest
+
+Create a preprocessing command that converts the raw index into a normalized manifest.
+
+Example:
+
+data/
+├── raw/
+│   ├── index.txt
+│   └── assets/
+│
+└── processed/
+    └── manifest.csv
+
+
+Example manifest:
+
+id,audio,text,section
+104,data/raw/assets/104.opus,adlaw,ad
+83,data/raw/assets/83.opus,adto,ad
+24,data/raw/assets/24.opus,ako,ak
+41,data/raw/assets/41.opus,akoa,ak
+
+
+The manifest is an intermediate representation and should make the PyTorch dataset independent from the unusual original index format.
+
+4. Dataset validation
+
+Implement:
+
+python -m src.data.validate
+
+
+It should check:
+
+Invalid index lines
+Duplicate IDs
+Duplicate audio paths
+Missing .opus files
+Unreadable/corrupt audio
+Empty transcriptions
+Invalid text encoding
+Unexpected filenames
+Number of valid samples
+Number of invalid samples
+
+Produce a clear summary.
+
+Example:
+
+Dataset validation
+------------------
+Total entries:       159
+Valid entries:       158
+Missing audio:       1
+Invalid entries:     0
+Duplicate IDs:       0
+
+
+The command should return a non-zero exit code when configured to fail on validation errors.
+
+5. Audio preprocessing
+
+Internally convert all audio into a consistent representation.
+
+Default:
+
+Sample rate: 16000 Hz
+Channels:    mono
+Format:      float32 tensor
+
+
+The preprocessing pipeline should:
+
+Load .opus.
+Decode compressed audio.
+Convert to mono.
+Resample to 16 kHz.
+Convert to a PyTorch tensor.
+Perform safe amplitude normalization if appropriate.
+Return the waveform and sample rate.
+
+Do not feed Opus compression directly into the neural network.
+
+Make audio preprocessing reusable by both training and inference.
+
+6. Text/token system
+
+Implement a configurable tokenizer/vocabulary.
+
+Initially support character-level tokenization.
+
+Example:
+
+"adlaw"
+
+
+becomes something equivalent to:
+
+[a, d, l, a, w]
+
+
+Include special tokens:
+
+<PAD>
+<UNK>
+<BOS>
+<EOS>
+
+
+Do not use the numeric audio ID as the target class.
+
+The model should learn text sequences, not the arbitrary dataset IDs.
+
+Save the vocabulary with every model version.
+
+For future expansion, the tokenizer should be replaceable with a subword tokenizer without rewriting the model or dataset architecture.
+
+7. PyTorch Dataset
+
+Implement a PyTorch Dataset that reads the processed manifest.
+
+Each sample should return something conceptually equivalent to:
+
+{
+    "audio": waveform,
+    "text": transcription,
+    "tokens": token_ids,
+    "id": sample_id
+}
+
+
+Implement a custom collate_fn that supports variable-length audio and text sequences.
+
+Use appropriate padding and padding masks.
+
+8. Dataset splitting
+
+Implement reproducible:
+
+train
+validation
+test
+
+
+splits.
+
+Default:
+
+80% train
+10% validation
+10% test
+
+
+Use a configurable random seed.
+
+Never allow the same sample ID to appear in multiple splits.
+
+Save the split information so future incremental training can reproduce the same evaluation sets.
+
+9. STT model
+
+Create a small, understandable experimental STT model using PyTorch.
+
+Architecture:
+
+waveform
+   ↓
+audio feature extraction
+   ↓
+audio encoder
+   ↓
+sequence representation
+   ↓
+text decoder
+   ↓
+token probabilities
+
+
+Use modular components:
+
+src/models/
+├── encoder.py
+├── decoder.py
+└── stt.py
+
+
+The architecture should be configurable.
+
+Keep it lightweight enough to run on a consumer GPU or CPU for development.
+
+Do not attempt to recreate a huge production model.
+
+Do not download pretrained model weights.
+
+The model must support variable-length audio.
+
+10. Training
+
+Implement:
+
+python -m src.training.train
+
+
+with configurable parameters.
+
+Support:
+
+batch size
+learning rate
+epochs
+optimizer
+gradient clipping
+device
+random seed
+checkpoint directory
+dataset manifest
+validation frequency
+replay ratio
+
+Default optimizer:
+
+AdamW
+
+
+Training output should include:
+
+epoch
+step
+train loss
+validation loss
+CER
+WER
+learning rate
+
+
+Use mixed precision automatically when CUDA is available and configured.
+
+11. Versioned checkpoints
+
+This is a core requirement.
+
+Never overwrite the previous trained model.
+
+Use:
+
+checkpoints/
+├── v001/
+├── v002/
+├── v003/
+└── latest.json
+
+
+Each version should contain:
+
+checkpoints/v001/
+├── model.pt
+├── optimizer.pt
+├── scheduler.pt
+├── vocabulary.json
+├── config.json
+├── training_state.json
+└── manifest.json
+
+
+training_state.json should contain information such as:
+
+{
+  "version": 1,
+  "epoch": 10,
+  "global_step": 5000,
+  "dataset_version": "v001",
+  "parent_checkpoint": null,
+  "train_loss": 0.0,
+  "validation_loss": 0.0,
+  "wer": 0.0,
+  "cer": 0.0
+}
+
+
+Do not use fake metric values in actual execution; the example above is only structural.
+
+12. Resume training
+
+Support:
+
+python -m src.training.train \
+    --resume checkpoints/v001
+
+
+This must restore:
+
+Model weights
+Optimizer state
+Scheduler state
+Vocabulary
+Model configuration
+Training step
+Epoch
+Random state where practical
+
+Training should continue from the existing checkpoint rather than initialize a new model.
+
+13. Incremental training
+
+Support training with new data:
+
+python -m src.training.train \
+    --from-checkpoint checkpoints/v001 \
+    --dataset data/processed/manifest_v002.csv
+
+
+The model must initialize from v001 and produce a new version:
+
+v001
+ ↓
+new dataset
+ ↓
+v002
+
+
+Never destroy v001.
+
+14. Replay / catastrophic forgetting prevention
+
+Implement optional replay training.
+
+When training on new data, allow a configurable percentage of samples from previous datasets to be mixed into the new training set.
+
+Example:
+
+python -m src.training.train \
+    --from-checkpoint checkpoints/v001 \
+    --dataset data/processed/manifest_v002.csv \
+    --replay-manifest data/processed/manifest_v001.csv \
+    --replay-ratio 0.30
+
+
+Meaning:
+
+70% new data
+30% replay data
+
+
+The implementation should make the replay ratio configurable.
+
+The purpose is to reduce catastrophic forgetting.
+
+Do not claim that replay completely prevents forgetting.
+
+15. Regression evaluation
+
+When incremental training is used, evaluate both:
+
+new dataset
+old/reference dataset
+
+
+This is important.
+
+For example:
+
+Before v002:
+old WER = 12%
+
+After v002:
+old WER = 14%
+new WER = 8%
+
+
+This allows us to see whether learning new data damaged previous capabilities.
+
+Store these metrics in the checkpoint metadata.
+
+16. WER and CER
+
+Implement:
+
+Word Error Rate
+Character Error Rate
+
+
+Decode model predictions back into text before calculating metrics.
+
+Report metrics separately for:
+
+training
+validation
+test
+
+
+where appropriate.
+
+17. Inference
+
+Create:
+
+src/inference/transcriber.py
+
+
+with a reusable class:
+
+transcriber = Transcriber(
+    checkpoint="checkpoints/v001"
+)
+
+text = transcriber.transcribe("sample.opus")
+print(text)
+
+
+The inference pipeline must use:
+
+The same audio preprocessing
+The same vocabulary
+The same model configuration
+
+that were used during training.
+
+Do not duplicate preprocessing logic in the API.
+
+18. FastAPI
+
+Create:
+
+src/api/
+├── main.py
+└── routes/
+    ├── health.py
+    └── stt.py
+
+
+Endpoints:
+
+GET /health
+POST /stt
+
+
+Health response:
+
+{
+  "status": "ok"
+}
+
+
+STT should accept an uploaded audio file.
+
+Example:
+
+POST /stt
+Content-Type: multipart/form-data
+file=<audio>
+
+
+Return:
+
+{
+  "text": "recognized text"
+}
+
+
+Load the model once during application startup.
+
+Do not load the checkpoint for every request.
+
+Do not put training logic inside FastAPI.
+
+FastAPI should call the same Transcriber implementation used by standalone inference.
+
+19. API configuration
+
+Support environment variables such as:
+
+STT_CHECKPOINT=checkpoints/latest
+STT_DEVICE=auto
+API_HOST=0.0.0.0
+API_PORT=8000
+
+
+The API should fail clearly if the configured checkpoint does not exist.
+
+20. Future TTS architecture
+
+Do not implement full TTS yet.
+
+However, structure the project so that TTS can later be added as:
+
+src/
+├── models/
+│   ├── stt.py
+│   └── tts.py
+│
+├── inference/
+│   ├── transcriber.py
+│   └── synthesizer.py
+│
+└── api/
+    └── routes/
+        ├── stt.py
+        └── tts.py
+
+
+Do not mix STT and TTS code unnecessarily.
+
+21. Future sentence data
+
+The current data consists primarily of isolated words.
+
+The architecture must also support future data such as:
+
+001.opus → "ako si Juan"
+002.opus → "asa ka padulong"
+003.opus → "unsa imong gibuhat"
+
+
+The dataset interface should not need to be rewritten when sentence recordings are introduced.
+
+The same fundamental relationship remains:
+
+audio → text sequence
+
+22. CLI commands
+
+Provide simple commands.
+
+Dataset preparation:
+
+python -m src.data.prepare
+
+
+Dataset validation:
+
+python -m src.data.validate
+
+
+Training:
+
+python -m src.training.train
+
+
+Resume training:
+
+python -m src.training.train \
+    --resume checkpoints/v001
+
+
+Incremental training:
+
+python -m src.training.train \
+    --from-checkpoint checkpoints/v001 \
+    --dataset data/processed/manifest_v002.csv \
+    --replay-manifest data/processed/manifest_v001.csv \
+    --replay-ratio 0.30
+
+
+Standalone inference:
+
+python -m src.inference.transcriber sample.opus
+
+
+API:
+
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+
+23. Tests
+
+Create tests for:
+
+tests/
+├── test_index_parser.py
+├── test_dataset.py
+├── test_vocabulary.py
+├── test_audio.py
+├── test_model.py
+├── test_checkpoint.py
+├── test_metrics.py
+└── test_api.py
+
+
+Test at minimum:
+
+Index parsing
+Section parsing
+ID extraction
+Missing audio detection
+Vocabulary encoding
+Vocabulary decoding
+Dataset loading
+Batch collation
+Model forward pass
+Variable-length inputs
+Checkpoint saving
+Checkpoint loading
+Resume training
+API health endpoint
+
+Tests must not require the full production dataset.
+
+Use tiny synthetic/mock samples where possible.
+
+24. Logging
+
+Use Python's standard logging system.
+
+Provide useful logs for:
+
+Dataset loading
+Number of samples
+Training progress
+Checkpoint creation
+Resume operations
+Model loading
+API startup
+Inference errors
+
+Avoid excessive logging for individual audio samples during normal operation.
+
+25. Reproducibility
+
+Set random seeds for:
+
+Python
+NumPy
+PyTorch
+
+where practical.
+
+Store the training configuration and relevant random seed information in each checkpoint.
+
+26. Dependencies
+
+Use a minimal dependency set.
+
+Expected core dependencies include:
+
+torch
+torchaudio
+fastapi
+uvicorn
+python-multipart
+numpy
+
+
+Use additional libraries only when they provide a clear benefit.
+
+Pin or constrain versions appropriately in the project configuration.
+
+27. Code quality
+
+Use:
+
+Python type hints
+Dataclasses where appropriate
+Small focused classes/functions
+Clear docstrings
+No global mutable training state
+No hardcoded absolute paths
+No hardcoded vocabulary
+No hardcoded dataset IDs
+No hidden downloading of pretrained models
+
+Keep configuration centralized.
+
+Avoid overengineering.
+
+28. README
+
+Create a complete README explaining:
+
+Project purpose
+Dataset structure
+Expected index.txt format
+Installation
+Dataset preparation
+Dataset validation
+Initial training
+Checkpoint structure
+Resume training
+Incremental training
+Replay training
+Evaluation
+Standalone inference
+FastAPI usage
+Future TTS architecture
+
+Include concrete commands.
+
+29. Important conceptual rules
+
+The implementation must follow these rules:
+
+Rule 1
+
+The numeric audio ID is an identifier, not a class label.
+
+Rule 2
+
+The model learns:
+
+audio → text
+
+
+not:
+
+audio → numeric ID
+
+Rule 3
+
+The original index.txt is immutable source data.
+
+Rule 4
+
+Processed manifests are derived data.
+
+Rule 5
+
+Checkpoints are immutable versions.
+
+Rule 6
+
+New training starts from an existing checkpoint when requested.
+
+Rule 7
+
+Old checkpoints must never be silently overwritten.
+
+Rule 8
+
+Incremental training should support replay data to reduce catastrophic forgetting.
+
+Rule 9
+
+Every new model version should be evaluated against both new and previous/reference data where possible.
+
+Rule 10
+
+FastAPI is an inference layer, not a training layer.
+
+Rule 11
+
+The system must work with the current isolated-word dataset while remaining compatible with future sentence-level recordings.
+
+30. Initial milestone
+
+Do not attempt to build a highly sophisticated speech model immediately.
+
+The first milestone is:
+
+index.txt
+    ↓
+parser
+    ↓
+manifest
+    ↓
+PyTorch Dataset
+    ↓
+small STT model
+    ↓
+train
+    ↓
+checkpoint/v001
+    ↓
+load checkpoint
+    ↓
+transcribe .opus
+    ↓
+FastAPI /stt
+
+
+Once this works end-to-end, improve the model and dataset incrementally.
+
+Generate the complete repository with working code for all required files.
+
+Do not provide pseudocode where a real implementation can reasonably be provided.
+
+After generating the project, explain how to install dependencies and run the first dataset validation, followed by a small training run.
+
+
+Make sure to generate the requirements.txt
+
+
+
+The generated repository is a foundation, not a finished production system. Do not over-engineer the neural architecture. Prioritize clean interfaces, testability, reproducibility, checkpointing, and incremental development. The next developer will implement and improve the model procedurally.
+
