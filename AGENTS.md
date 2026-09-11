@@ -6,14 +6,29 @@ by running the commands in this environment (Windows, PowerShell).
 ## Core commands
 
 ```powershell
-python -m src.data.prepare                  # index.txt -> data/processed/manifest.csv
-python -m src.data.validate --fail-on-error # dataset checks; exits 1 on errors
-python -m src.training.train                # train; see flags below
+python ns.py prepare                        # index.txt -> data/processed/manifest.csv
+python ns.py validate --fail-on-error       # dataset checks; exits 1 on errors
+python ns.py train                          # train; see flags below
+python ns.py transcribe <audio> --checkpoint checkpoints/latest
+python ns.py optimize                       # INT8 quant + ONNX export
+python -m src.data.prepare                  # underlying equivalents (same args)
+python -m src.data.validate --fail-on-error
+python -m src.training.train
 python -m src.inference.transcriber <audio> --checkpoint checkpoints/latest
-python -m src.deploy.optimize               # INT8 quant + ONNX export
+python -m src.deploy.optimize
 uvicorn src.api.main:app --port 8000        # FastAPI (model loaded once at startup)
 python -m pytest tests -q                   # 50 tests; no real dataset needed
 ```
+
+`ns.py` is a shell-agnostic wrapper: it forwards all subcommand args verbatim to the
+`src.*` modules, so any flag accepted by `python -m src.<module>` works identically.
+Run `python ns.py train --help` for the full flag list.
+
+Custom commands are registered in `ns.py`'s `COMMANDS` dict, each mapping a subcommand
+name to `(module_main, one-line_help)`. Adding a new command means only: add an entry to
+`COMMANDS`, keep `__main__` + `main()` in the target module (so both `ns.py <cmd>` and
+`python -m src.<module>` work), and it shows up automatically in `python ns.py help`.
+Args are forwarded raw — parser options live in the target module's argparse, not `ns.py`.
 
 Training flags that matter: `--resume <dir>` (restores optimizer/scheduler/epoch/RNG),
 `--from-checkpoint <dir>` (incremental: fresh optimizer, records `parent_checkpoint`),
