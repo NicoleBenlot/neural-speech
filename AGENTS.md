@@ -10,6 +10,8 @@ python ns.py prepare                        # index.txt -> data/processed/manife
 python ns.py validate --fail-on-error       # dataset checks; exits 1 on errors
 python ns.py train                          # train; see flags below
 python ns.py transcribe <audio> --checkpoint checkpoints/latest
+python ns.py mic --seconds 5                # record mic + transcribe (real-time test)
+python ns.py mic --loop --seconds 3         # keep going until Ctrl+C
 python ns.py optimize                       # INT8 quant + ONNX export
 python -m src.data.prepare                  # underlying equivalents (same args)
 python -m src.data.validate --fail-on-error
@@ -42,6 +44,10 @@ Never combine `--resume` and `--from-checkpoint`.
   automatically falls back to soundfile. Tests exploit this: fixtures write real WAV
   bytes under `.opus` filenames (decoding is content-based, so it works without FFmpeg).
   Real `.opus` transcription relies on the fallback too.
+- **Mic capture** (`src/inference/mic.py`): records 16 kHz mono float32 via sounddevice
+  (wheel bundles PortAudio, no system install) to a temp WAV, then runs it through the
+  same `Transcriber` as the CLI/API. The sounddevice import is lazy, so commands like
+  `ns.py help` still work if it's not installed.
 - **ONNX export** (`src/deploy/onnx_export.py`) must pass `dynamo=False` — the default
   dynamo exporter needs `onnxscript`, which is not a dependency. The exported graph
   wraps the model because `STTModel.forward` takes 4 args; the wrapper derives

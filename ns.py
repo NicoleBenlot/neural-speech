@@ -20,6 +20,7 @@ from typing import Dict, Tuple
 from src.data import prepare as prepare_mod
 from src.data import validate as validate_mod
 from src.deploy import optimize as optimize_mod
+from src.inference import mic as mic_mod
 from src.inference import transcriber as transcribe_mod
 from src.training import train as train_mod
 
@@ -28,6 +29,7 @@ COMMANDS: Dict[str, tuple] = {
     "validate": (validate_mod.main, "dataset integrity checks"),
     "train": (train_mod.main, "train the STT model"),
     "transcribe": (transcribe_mod.main, "transcribe an audio file"),
+    "mic": (mic_mod.main, "record from mic and transcribe (real-time test)"),
     "optimize": (optimize_mod.main, "quantize + export a checkpoint"),
 }
 
