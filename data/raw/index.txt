@@ -1,0 +1,337 @@
+[ab]
+abtik = 185
+
+[ad]
+adlaw = 104
+adto = 83
+
+[ak]
+ako = 24
+akoa = 41
+akong = 35
+
+[am]
+amo = 44
+among = 38
+
+[an]
+andam = 181
+ang = 1
+anhi = 84
+
+[ap]
+apan = 11
+
+[ar]
+ari = 85
+aron = 9
+
+[as]
+asa = 71
+
+[at]
+ato = 45
+atong = 39
+atubangan = 91
+
+[ay]
+ayaw = 52
+
+[ba]
+bag-o = 170
+baga = 141
+bakak = 167
+bakante = 184
+barato = 158
+basa = 148
+basin = 66
+bati = 134
+bayad = 183
+
+[bi]
+bisan = 14
+
+[bu]
+bug-at = 143
+bugnaw = 146
+bulan = 106
+buntag = 18
+buotan = 187
+
+[da]
+daan = 171
+dagan = 193
+dako = 135
+dali = 119
+dalo = 159
+dapat = 55
+dayon = 113
+dayun = 21
+
+[di]
+didto = 82
+dili = 51
+dinhi = 81
+diri = 80
+
+[du]
+dugay = 118
+duha = 121
+duol = 172
+
+[es]
+espesyal = 177
+
+[ga]
+gaan = 144
+gabii = 102
+gahapon = 98
+gamay = 136
+ganahan = 57
+
+[gi]
+gikan = 87
+giunsa = 76
+
+[gw]
+gwapa = 133
+gwapo = 132
+
+[ha]
+hain = 73
+hangtud = 16
+hapon = 101
+
+[hi]
+hiktin = 140
+hinay = 153
+
+[hu]
+hugaw = 151
+
+[ib]
+ibabaw = 89
+
+[ig]
+igo = 163
+
+[ik]
+ikaw = 25
+
+[il]
+ila = 46
+ilang = 40
+
+[im]
+imo = 42
+imong = 36
+importante = 174
+imposible = 63
+
+[in]
+init = 145
+
+[iy]
+iya = 43
+iyang = 37
+
+[ka]
+ka = 29
+kabalo = 58
+kadlawon = 103
+kahibalo = 59
+kang = 34
+kanunay = 115
+kanus-a = 74
+kapoy = 190
+karon = 97
+kasabot = 61
+kay = 6
+
+[ki]
+kilid = 93
+kinahanglan = 56
+kinsa = 69
+
+[kl]
+klaro = 168
+
+[ko]
+ko = 28
+komplikado = 179
+kon = 19
+
+[ku]
+kulang = 161
+kung = 7
+kusog = 152
+
+[la]
+lakaw = 192
+lapad = 139
+layo = 173
+
+[li]
+libre = 182
+likod = 92
+lima = 124
+limpyo = 150
+lisod = 156
+
+[ma]
+ma = 72
+maayo = 130
+maayung = 17
+mahal = 157
+mahimo = 54
+malipayon = 188
+mao = 8
+
+[mi]
+mi = 31
+minuto = 109
+
+[mo]
+mo = 30
+
+[mu]
+mubo = 138
+murag = 67
+
+[na]
+naa = 47
+naog = 195
+napulo = 129
+nasuko = 189
+
+[ng]
+nga = 5
+ngadto = 86
+ngano = 75
+
+[ni]
+ni = 33
+nindot = 131
+nipis = 142
+
+[no]
+normal = 176
+
+[o]
+o = 23
+
+[og]
+og = 4
+
+[oo]
+oo = 50
+
+[or]
+oras = 108
+
+[pa]
+padulong = 88
+palibut = 96
+panagsa = 117
+para = 10
+paspas = 154
+
+[pe]
+permi = 114
+pero = 12
+
+[pi]
+pila = 78
+pito = 126
+
+[po]
+posible = 62
+
+[pu]
+puno = 160
+
+[pw]
+pwedi = 53
+
+[sa]
+sa = 2
+sabaw = 49
+sabot = 60
+saka = 194
+sakit = 191
+sakto = 164
+samtang = 15
+sayon = 155
+sayop = 165
+
+[se]
+segundo = 110
+semana = 105
+seryoso = 180
+
+[si]
+siguro = 64
+sila = 27
+simple = 178
+siya = 26
+siyam = 128
+
+[su]
+subra = 162
+sunod = 70
+
+[ta]
+ta = 32
+taas = 137
+tagpila = 79
+tapad = 95
+tapulan = 186
+
+[ti]
+tin-aw = 169
+tingali = 65
+tinuod = 166
+
+[tu]
+tugnaw = 147
+tuig = 107
+tulo = 122
+tunga = 94
+tungod = 13
+
+[ub]
+ubos = 90
+
+[ud]
+udto = 100
+
+[ug]
+ug = 3
+uga = 149
+ugma = 99
+
+[ul]
+ulahi = 112
+
+[un]
+una = 111
+unom = 125
+unsa = 68
+unsaon = 77
+unya = 20
+
+[up]
+upat = 123
+
+[us]
+usa = 120
+usab = 22
+usahay = 116
+
+[wa]
+wala = 48
+walo = 127
+
+[ze]
+zebra = 175
+
