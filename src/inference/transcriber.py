@@ -54,9 +54,11 @@ class Transcriber:
         checkpoint: str = "checkpoints/latest",
         device: str = "auto",
         max_length: int = 128,
+        beam_size: int = 5,
     ):
         self.checkpoint = checkpoint
         self.device = resolve_device(device)
+        self.beam_size = beam_size
 
         root, name = _split_checkpoint(checkpoint)
         self.manager = CheckpointManager(root)
@@ -91,10 +93,11 @@ class Transcriber:
         lengths = torch.tensor([waveform.shape[1]], device=self.device)
 
         with torch.no_grad():
-            ids = self.model.greedy_decode(
+            ids = self.model.decode(
                 audio,
                 lengths,
                 max_len=self.max_length,
+                beam_size=self.beam_size,
                 bos_token_id=self.tokenizer.bos_id,
                 eos_token_id=self.tokenizer.eos_id,
             )
@@ -123,9 +126,10 @@ def main():
     parser.add_argument("audio", help="Path to audio file (e.g. sample.opus)")
     parser.add_argument("--checkpoint", default="checkpoints/latest", help="Checkpoint dir or alias")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--beam-size", type=int, default=5, help="Beam width (1 = greedy)")
     args = parser.parse_args()
 
-    t = Transcriber(checkpoint=args.checkpoint, device=args.device)
+    t = Transcriber(checkpoint=args.checkpoint, device=args.device, beam_size=args.beam_size)
     text = t.transcribe(args.audio)
     print(text)
 

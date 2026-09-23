@@ -12,6 +12,8 @@ python ns.py train                          # train; see flags below
 python ns.py transcribe <audio> --checkpoint checkpoints/latest
 python ns.py mic --seconds 5                # record mic + transcribe (real-time test)
 python ns.py mic --loop --seconds 3         # keep going until Ctrl+C
+python ns.py mic --tts-backend piper        # also speak the result back
+python ns.py mic --tts-backend none         # transcription only
 python ns.py optimize                       # INT8 quant + ONNX export
 python -m src.data.prepare                  # underlying equivalents (same args)
 python -m src.data.validate --fail-on-error
@@ -61,6 +63,12 @@ Never combine `--resume` and `--from-checkpoint`.
   version dir; the manager errors if you do. `latest.json` points at the newest.
 - `torch.load(..., weights_only=False)` is required for optimizer/scheduler/RNG files
   (torch ≥2.6 defaults to weights_only=True and fails).
+- **TTS speaker** (`src/inference/speaker.py`): piper-tts 1.8 no longer has an
+  auto voice downloader — voices (`.onnx` + `.onnx.json`) must be fetched from
+  HuggingFace `rhasspy/piper-voices` into `voices/`. Its `AudioChunk` bytes are
+  raw int16 PCM (no RIFF header); `_merge_piper_chunks` wraps them. `piper-tts`
+  installs on 3.14 via a cp39-abi3 wheel; `pyttsx3` falls back to OS voices.
+  The `online` backend name is registered but unimplemented (edge-tts/Azure hook).
 
 ## Architecture (non-obvious)
 

@@ -35,7 +35,7 @@ class TextDecoder(nn.Module):
 
     def _causal_mask(self, size: int, device: torch.device) -> torch.Tensor:
         return torch.triu(
-            torch.full((size, size), float("-inf"), device=device),
+            torch.ones(size, size, dtype=torch.bool, device=device),
             diagonal=1,
         )
 

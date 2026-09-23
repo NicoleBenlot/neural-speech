@@ -27,7 +27,7 @@ from src.data.dataset import (
 )
 from src.data.prepare import write_manifest
 from src.models.stt import STTConfig, STTModel, build_stt_model
-from src.tokens.tokenizer import CharTokenizer
+from src.tokens.tokenizer import BLANK, CharTokenizer
 from src.training.checkpoint import CheckpointManager, TrainingState
 from src.training.metrics import cer, compute_metrics, wer
 
@@ -64,6 +64,7 @@ class TrainConfig:
     eval_manifest: Optional[str] = None
     max_audio_len: int = 5
     max_text_len: int = 64
+    beam_size: int = 5
     model: STTConfig = field(default_factory=STTConfig)
 
     sample_rate: int = 16000
@@ -130,6 +131,8 @@ class Trainer:
             rows = read_manifest(manifest)
             self.tokenizer = CharTokenizer()
             self.tokenizer.build_from_texts([r.text for r in rows])
+            if self.config.model.head == "ctc":
+                self.tokenizer.add_blank()
             train_rows, valid_rows, test_rows = split_dataset(
                 rows, seed=self.config.seed
             )
@@ -166,6 +169,11 @@ class Trainer:
 
     def _build_model_and_optimizer(self):
         if self.model is None:
+            if self.config.model.head == "ctc" and self.config.model.blank_token_id is None:
+                blank_id = self.tokenizer.blank_id
+                if blank_id is None:
+                    raise RuntimeError("CTC training requires a blank token in the tokenizer")
+                self.config.model.blank_token_id = blank_id
             self.model = build_stt_model(self.config.model, self.tokenizer.vocab_size())
             self.model.to(self.device)
 
@@ -376,19 +384,15 @@ class Trainer:
             audio_lengths = batch.audio_lengths.to(self.device)
             tokens = batch.tokens.to(self.device)
             token_lengths = batch.token_lengths.to(self.device)
-            in_tokens = tokens[:, :-1]
-            in_tok_lens = token_lengths - 1
-            target = tokens[:, 1:]
 
             self.optimizer.zero_grad()
 
             with torch.autocast(
                 device_type=self.device.type, enabled=self.use_amp
             ):
-                logits = self.model(
-                    audio, audio_lengths, in_tokens, in_tok_lens
+                loss = self._batch_loss(
+                    audio, audio_lengths, tokens, token_lengths
                 )
-                loss = self._compute_loss(logits, target, token_lengths)
 
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
@@ -429,10 +433,13 @@ class Trainer:
                 if sample_batches >= max(2, 64 // self.config.batch_size):
                     break
                 sample_batches += 1
-                hyp_ids = self.model.greedy_decode(
+                hyp_ids = self.model.decode(
                     batch.audio.to(self.device),
                     batch.audio_lengths.to(self.device),
                     max_len=self.config.max_text_len,
+                    beam_size=self.config.beam_size,
+                    bos_token_id=self.tokenizer.bos_id,
+                    eos_token_id=self.tokenizer.eos_id,
                 )
                 for h, ref in zip(hyp_ids, batch.texts):
                     all_preds.append(self.tokenizer.decode(h))
@@ -441,6 +448,70 @@ class Trainer:
         avg_loss = total_loss / max(n_batches, 1)
         metrics = compute_metrics(all_refs, all_preds)
         return avg_loss, metrics.cer, metrics.wer
+
+    def _batch_loss(
+        self,
+        audio: torch.Tensor,
+        audio_lengths: torch.Tensor,
+        tokens: torch.Tensor,
+        token_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the training loss for one batch (CTC or seq2seq)."""
+        if self.config.model.head == "ctc":
+            log_probs = self.model.forward_ctc(audio, audio_lengths)
+            return self._compute_ctc_loss(log_probs, audio_lengths, tokens, token_lengths)
+
+        in_tokens = tokens[:, :-1]
+        in_tok_lens = torch.clamp(token_lengths - 1, min=1)
+        target = tokens[:, 1:]
+        logits = self.model(audio, audio_lengths, in_tokens, in_tok_lens)
+        return self._compute_loss(logits, target, token_lengths)
+
+    def _compute_ctc_loss(
+        self,
+        log_probs: torch.Tensor,
+        audio_lengths: torch.Tensor,
+        tokens: torch.Tensor,
+        token_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """CTC loss over per-timestep log-probs.
+
+        The dataset encodes labels as [BOS, chars..., EOS] (with PAD after);
+        CTC targets are the raw character sequence only - BOS/EOS are
+        stripped. CTCLoss needs time-major log-probs (T, N, C), input
+        lengths (encoder frames, pre-padding), and target lengths.
+        """
+        b, t, c = log_probs.shape
+        lp = log_probs.transpose(0, 1).contiguous()  # (T, N, C)
+
+        input_lengths = self.model.ctc_input_lengths(audio_lengths).clamp(max=t)
+
+        target_parts = []
+        target_lengths = torch.zeros(b, dtype=torch.long, device=log_probs.device)
+        for i in range(b):
+            tl = int(token_lengths[i].item())
+            target_parts.append(tokens[i, 1 : tl - 1])  # skip BOS and EOS
+            target_lengths[i] = max(tl - 2, 0)
+        targets = (
+            torch.cat(target_parts)
+            if target_parts
+            and any(p.numel() for p in target_parts)
+            else torch.zeros(0, dtype=torch.long, device=log_probs.device)
+        )
+
+        blank_id = (
+            self.config.model.blank_token_id
+            if self.config.model.blank_token_id is not None
+            else 0
+        )
+        return nn.functional.ctc_loss(
+            lp,
+            targets,
+            input_lengths,
+            target_lengths,
+            blank=blank_id,
+            zero_infinity=True,
+        )
 
     def _compute_loss(
         self, logits: torch.Tensor, target: torch.Tensor, token_lengths: torch.Tensor
@@ -480,24 +551,22 @@ class Trainer:
                 tokens = batch.tokens.to(self.device)
                 token_lengths = batch.token_lengths.to(self.device)
 
-                in_tokens = tokens[:, :-1]
-                in_tok_lens = torch.clamp(token_lengths - 1, min=1)
-                target = tokens[:, 1:]
-
                 with torch.autocast(
                     device_type=self.device.type, enabled=self.use_amp
                 ):
-                    logits = self.model(
-                        audio, audio_lengths, in_tokens, in_tok_lens
+                    loss = self._batch_loss(
+                        audio, audio_lengths, tokens, token_lengths
                     )
-                    loss = self._compute_loss(logits, target, token_lengths)
                 total_loss += loss.item()
                 n_batches += 1
 
-                hyp_ids = self.model.greedy_decode(
+                hyp_ids = self.model.decode(
                     audio,
                     audio_lengths,
                     max_len=self.config.max_text_len,
+                    beam_size=self.config.beam_size,
+                    bos_token_id=self.tokenizer.bos_id,
+                    eos_token_id=self.tokenizer.eos_id,
                 )
                 for h, ref in zip(hyp_ids, batch.texts):
                     all_preds.append(self.tokenizer.decode(h))
@@ -575,10 +644,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-fp16", action="store_true", help="Disable mixed precision")
     parser.add_argument("--split-dir", default="data/processed")
     parser.add_argument("--max-text-len", type=int, default=64)
+    parser.add_argument("--beam-size", type=int, default=5, help="Beam width for eval decoding (1 = greedy)")
     parser.add_argument("--model-d-model", type=int, default=128)
     parser.add_argument("--model-heads", type=int, default=4)
     parser.add_argument("--model-encoder-layers", type=int, default=3)
     parser.add_argument("--model-decoder-layers", type=int, default=3)
+    parser.add_argument(
+        "--model-head",
+        default="decoder",
+        choices=["decoder", "ctc"],
+        help="Head: 'decoder' (seq2seq, teacher-forced CE) or 'ctc' (CTC head, "
+        "diagnostic). CTC disables teacher forcing entirely.",
+    )
     return parser
 
 
@@ -592,6 +669,7 @@ def main():
         nhead=args.model_heads,
         encoder_layers=args.model_encoder_layers,
         decoder_layers=args.model_decoder_layers,
+        head=args.model_head,
     )
     config = TrainConfig(
         batch_size=args.batch_size,
@@ -612,6 +690,7 @@ def main():
         split_dir=args.split_dir,
         eval_manifest=args.eval_manifest,
         max_text_len=args.max_text_len,
+        beam_size=args.beam_size,
         model=model_config,
     )
 

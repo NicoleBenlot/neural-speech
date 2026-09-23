@@ -79,7 +79,9 @@ class AudioEncoder(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
-        self.encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
+        self.encoder = nn.TransformerEncoder(
+            self.encoder_layer, num_layers=num_layers, enable_nested_tensor=False
+        )
 
     def forward(
         self,

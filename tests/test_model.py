@@ -71,3 +71,69 @@ def test_greedy_decode_ends():
         )
     assert isinstance(ids[0], list)
     assert ids[0][-1] == tok.eos_id
+
+
+def test_beam_decode_matches_greedy_with_beam_1():
+    tok = CharTokenizer()
+    tok.build_from_texts(["adlaw"])
+    model = _make_model(vocab_size=tok.vocab_size())
+    model.eval()
+
+    audio = torch.randn(1, 1, 4000)
+    lengths = torch.tensor([4000])
+    with torch.no_grad():
+        greedy = model.greedy_decode(
+            audio, lengths, max_len=10, bos_token_id=tok.bos_id, eos_token_id=tok.eos_id
+        )
+        beamed = model.beam_decode(
+            audio,
+            lengths,
+            max_len=10,
+            beam_size=1,
+            bos_token_id=tok.bos_id,
+            eos_token_id=tok.eos_id,
+        )
+    assert isinstance(beamed[0], list)
+    assert greedy == beamed
+
+
+def test_beam_decode_ends_with_eos():
+    tok = CharTokenizer()
+    tok.build_from_texts(["adlaw"])
+    model = _make_model(vocab_size=tok.vocab_size())
+    model.eval()
+
+    audio = torch.randn(1, 1, 4000)
+    lengths = torch.tensor([4000])
+    with torch.no_grad():
+        beamed = model.beam_decode(
+            audio,
+            lengths,
+            max_len=10,
+            beam_size=5,
+            bos_token_id=tok.bos_id,
+            eos_token_id=tok.eos_id,
+        )
+    assert isinstance(beamed[0], list)
+    assert beamed[0][-1] == tok.eos_id
+
+
+def test_decode_dispatch_with_beam_1():
+    tok = CharTokenizer()
+    tok.build_from_texts(["adlaw"])
+    model = _make_model(vocab_size=tok.vocab_size())
+    model.eval()
+
+    audio = torch.randn(1, 1, 4000)
+    lengths = torch.tensor([4000])
+    with torch.no_grad():
+        ids = model.decode(
+            audio,
+            lengths,
+            max_len=10,
+            beam_size=3,
+            bos_token_id=tok.bos_id,
+            eos_token_id=tok.eos_id,
+        )
+    assert isinstance(ids[0], list)
+    assert -1 < ids[0][-1] < tok.vocab_size()

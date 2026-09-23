@@ -14,6 +14,7 @@ PAD = "<PAD>"
 UNK = "<UNK>"
 BOS = "<BOS>"
 EOS = "<EOS>"
+BLANK = "<BLANK>"
 
 SPECIAL_TOKENS = [PAD, UNK, BOS, EOS]
 
@@ -25,6 +26,7 @@ class TokenizerConfig:
     unk_token: str = UNK
     bos_token: str = BOS
     eos_token: str = EOS
+    blank_token: Optional[str] = None  # set to BLANK for CTC training
 
 
 class BaseTokenizer(Protocol):
@@ -71,6 +73,18 @@ class CharTokenizer:
     def eos_id(self) -> int:
         return self.char_to_id[self.config.eos_token]
 
+    @property
+    def blank_id(self) -> Optional[int]:
+        """CTC blank token id, or None when no blank token is configured."""
+        if self.config.blank_token is None:
+            return None
+        return self.char_to_id.get(self.config.blank_token)
+
+    def add_blank(self, token: str = BLANK):
+        """Append the CTC blank token (at the end of the vocabulary)."""
+        self.config.blank_token = token
+        self.add_char(token)
+
     def add_char(self, char: str) -> int:
         if char in self.char_to_id:
             return self.char_to_id[char]
@@ -99,7 +113,9 @@ class CharTokenizer:
         chars = []
         for idx in ids:
             token = self.id_to_char.get(idx, self.config.unk_token)
-            if skip_special and token in SPECIAL_TOKENS:
+            if skip_special and (
+                token in SPECIAL_TOKENS or token == self.config.blank_token
+            ):
                 continue
             chars.append(token)
         return "".join(chars)
@@ -116,6 +132,7 @@ class CharTokenizer:
                 "unk_token": self.config.unk_token,
                 "bos_token": self.config.bos_token,
                 "eos_token": self.config.eos_token,
+                "blank_token": self.config.blank_token,
             },
             "char_to_id": self.char_to_id,
         }

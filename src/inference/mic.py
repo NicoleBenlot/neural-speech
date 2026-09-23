@@ -1,9 +1,11 @@
-"""Record microphone audio and transcribe it in the terminal.
+"""Record microphone audio, transcribe it, and speak the result back.
 
 Usage:
     python ns.py mic --seconds 5
     python ns.py mic --loop --seconds 3
     python ns.py mic --list-devices --checkpoint checkpoints/v005
+    python ns.py mic --tts-backend piper --voice en_US-lessac-medium
+    python ns.py mic --tts-backend none   # transcription only
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ try:
 except ImportError:  # pragma: no cover - depends on local environment
     sd = None
 
+from src.inference.speaker import BACKENDS, create_speaker
 from src.inference.transcriber import Transcriber
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -74,7 +77,8 @@ def _transcribe_clip(transcriber: Transcriber, seconds: float) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Record from the microphone and transcribe with a checkpoint"
+        description="Record from the microphone, transcribe, and (optionally) "
+        "speak the recognized text back"
     )
     parser.add_argument("--seconds", type=float, default=5.0, help="Recording length in seconds")
     parser.add_argument(
@@ -84,7 +88,16 @@ def main() -> int:
     )
     parser.add_argument("--checkpoint", default="checkpoints/latest", help="Checkpoint dir or alias")
     parser.add_argument("--device", default="auto", help="Torch device (auto, cpu, cuda)")
+    parser.add_argument("--beam-size", type=int, default=5, help="Beam width (1 = greedy)")
     parser.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
+    parser.add_argument(
+        "--tts-backend",
+        choices=BACKENDS,
+        default="auto",
+        help="Speak the recognized text back using this backend (default: auto)",
+    )
+    parser.add_argument("--voice-dir", default="voices", help="Directory with piper voices")
+    parser.add_argument("--voice", default="en_US-lessac-medium", help="Piper voice name")
     args = parser.parse_args()
 
     if args.list_devices:
@@ -102,30 +115,66 @@ def main() -> int:
         print(f"error: {exc}")
         return 1
 
-    transcriber = Transcriber(checkpoint=args.checkpoint, device=args.device)
+    transcriber = Transcriber(checkpoint=args.checkpoint, device=args.device, beam_size=args.beam_size)
+
+    try:
+        speaker = create_speaker(backend=args.tts_backend, voice_dir=args.voice_dir, voice=args.voice)
+    except RuntimeError as exc:
+        print(f"error: {exc}")
+        return 1
+
+    if args.tts_backend != "none" and speaker is None:
+        print("note: TTS unavailable (backend/voice missing) - transcribing only.")
+        if not args.loop:
+            try:
+                print(_transcribe_clip(transcriber, args.seconds))
+            except RuntimeError as exc:
+                print(f"error: {exc}")
+                return 1
+            return 0
+        return _loop(transcriber, speaker, args.seconds)
 
     if not args.loop:
         try:
-            print(_transcribe_clip(transcriber, args.seconds))
+            text = _transcribe_clip(transcriber, args.seconds)
         except RuntimeError as exc:
             print(f"error: {exc}")
             return 1
+        print(text)
+        _speak(speaker, text)
         return 0
 
+    return _loop(transcriber, speaker, args.seconds)
+
+
+def _loop(transcriber: Transcriber, speaker, seconds: float) -> int:
+    """Record/transcribe/speak repeatedly until Ctrl+C."""
     try:
         while True:
             try:
-                text = _transcribe_clip(transcriber, args.seconds)
+                text = _transcribe_clip(transcriber, seconds)
             except RuntimeError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 1
             print(f"> {text}")
+            _speak(speaker, text)
     except KeyboardInterrupt:
         print("\nStopped.")
         return 0
     except Exception:
         logger.exception("Mic transcription failed")
         return 1
+
+
+def _speak(speaker, text: str) -> None:
+    if speaker is None:
+        return
+    try:
+        speaker.speak(text)
+    except NotImplementedError as exc:
+        print(f"note: speech output not available: {exc}", file=sys.stderr)
+    except RuntimeError as exc:
+        print(f"note: could not speak text: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
