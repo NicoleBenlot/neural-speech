@@ -12,7 +12,7 @@ from fastapi import FastAPI
 
 from src.api.routes import health, stt, tts
 from src.inference.speaker import create_speaker
-from src.inference.transcriber import Transcriber
+from src.inference.transcriber import DEFAULT_CHECKPOINT, Transcriber
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ def load_model_sync():
     FastAPI is an inference layer only. The checkpoint path is resolved via
     STT_CHECKPOINT; the app fails clearly if it does not exist.
     """
-    checkpoint = os.environ.get("STT_CHECKPOINT", "checkpoints/latest")
+    checkpoint = os.environ.get("STT_CHECKPOINT", DEFAULT_CHECKPOINT)
     device = os.environ.get("STT_DEVICE", "auto")
 
     try:

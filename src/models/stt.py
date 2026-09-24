@@ -47,7 +47,13 @@ class STTConfig:
 class STTModel(nn.Module):
     """waveform -> features -> encoder -> decoder -> token probs."""
 
-    def __init__(self, config: STTConfig, vocab_size: int):
+    def __init__(
+        self,
+        config: STTConfig,
+        vocab_size: int,
+        device: Optional[torch.device] = None,
+        local_files_only: bool = False,
+    ):
         super().__init__()
         self.config = config
         self.vocab_size = vocab_size
@@ -60,6 +66,8 @@ class STTModel(nn.Module):
             self.mms_encoder = MMSAudioEncoder(
                 model_id=config.backbone,
                 unfreeze_layers=config.backbone_unfreeze_layers,
+                device=device,
+                local_files_only=local_files_only,
             )
             self.feature_extractor = None
             self.encoder = None

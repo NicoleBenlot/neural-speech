@@ -10,7 +10,7 @@ import torch
 
 from src.models.stt import STTModel
 from src.training.checkpoint import CheckpointManager
-from src.inference.transcriber import _checkpoint_name, _checkpoint_root
+from src.inference.transcriber import DEFAULT_CHECKPOINT, _checkpoint_name, _checkpoint_root
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ class _ONNXWrapper(torch.nn.Module):
 
 
 def export_onnx(
-    checkpoint: str = "checkpoints/latest",
+    checkpoint: str = DEFAULT_CHECKPOINT,
     output: Optional[str] = None,
     opset: int = 17,
     dynamic_axes: bool = True,
@@ -122,7 +122,7 @@ def check_tensorrt():
 
 
 def export_tensorrt(
-    checkpoint: str = "checkpoints/latest",
+    checkpoint: str = DEFAULT_CHECKPOINT,
     output: Optional[str] = None,
     precision: str = "fp16",
 ) -> Optional[Path]:

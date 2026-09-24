@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -16,10 +17,12 @@ from src.tokens.tokenizer import CharTokenizer
 from src.training.checkpoint import (
     CheckpointManager,
 )
-from src.training.train import resolve_device
+from src.device_info import resolve_device
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+DEFAULT_CHECKPOINT = "checkpoints/mms/latest"
 
 
 def _split_checkpoint(checkpoint: str) -> tuple[str, str]:
@@ -51,14 +54,20 @@ class Transcriber:
 
     def __init__(
         self,
-        checkpoint: str = "checkpoints/latest",
+        checkpoint: str = DEFAULT_CHECKPOINT,
         device: str = "auto",
         max_length: int = 128,
         beam_size: int = 5,
+        offline: Optional[bool] = None,
     ):
         self.checkpoint = checkpoint
         self.device = resolve_device(device)
         self.beam_size = beam_size
+        self.offline = (
+            os.environ.get("HF_HUB_OFFLINE", "").lower() in {"1", "true", "yes", "on"}
+            if offline is None
+            else offline
+        )
 
         root, name = _split_checkpoint(checkpoint)
         self.manager = CheckpointManager(root)
@@ -67,7 +76,12 @@ class Transcriber:
         self.tokenizer: CharTokenizer = data["tokenizer"]
         self.config: STTConfig = data["config"]
 
-        self.model = STTModel(self.config, vocab_size=self.tokenizer.vocab_size())
+        self.model = STTModel(
+            self.config,
+            vocab_size=self.tokenizer.vocab_size(),
+            device=self.device,
+            local_files_only=self.offline,
+        )
         self.model.load_state_dict(data["model_sd"])
         self.model.to(self.device)
         self.model.eval()
@@ -124,12 +138,23 @@ def _checkpoint_name(checkpoint: str) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Standalone STT transcription")
     parser.add_argument("audio", help="Path to audio file (e.g. sample.opus)")
-    parser.add_argument("--checkpoint", default="checkpoints/latest", help="Checkpoint dir or alias")
+    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT, help="Checkpoint dir or alias")
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        default=None,
+        help="Use only the local Hugging Face cache (also enabled by HF_HUB_OFFLINE=1)",
+    )
     parser.add_argument("--beam-size", type=int, default=5, help="Beam width (1 = greedy)")
     args = parser.parse_args()
 
-    t = Transcriber(checkpoint=args.checkpoint, device=args.device, beam_size=args.beam_size)
+    t = Transcriber(
+        checkpoint=args.checkpoint,
+        device=args.device,
+        beam_size=args.beam_size,
+        offline=args.offline,
+    )
     text = t.transcribe(args.audio)
     print(text)
 

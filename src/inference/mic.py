@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover - depends on local environment
     sd = None
 
 from src.inference.speaker import BACKENDS, create_speaker
-from src.inference.transcriber import Transcriber
+from src.inference.transcriber import DEFAULT_CHECKPOINT, Transcriber
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -86,8 +86,16 @@ def main() -> int:
         action="store_true",
         help="Keep recording and transcribing until Ctrl+C",
     )
-    parser.add_argument("--checkpoint", default="checkpoints/latest", help="Checkpoint dir or alias")
+    parser.add_argument(
+        "--checkpoint", default=DEFAULT_CHECKPOINT, help="Checkpoint dir or alias"
+    )
     parser.add_argument("--device", default="auto", help="Torch device (auto, cpu, cuda)")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        default=None,
+        help="Use only the local Hugging Face cache (also enabled by HF_HUB_OFFLINE=1)",
+    )
     parser.add_argument("--beam-size", type=int, default=5, help="Beam width (1 = greedy)")
     parser.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
     parser.add_argument(
@@ -115,7 +123,13 @@ def main() -> int:
         print(f"error: {exc}")
         return 1
 
-    transcriber = Transcriber(checkpoint=args.checkpoint, device=args.device, beam_size=args.beam_size)
+    transcriber = Transcriber(
+        checkpoint=args.checkpoint,
+        device=args.device,
+        beam_size=args.beam_size,
+        offline=args.offline,
+    )
+    logger.info("Mic inference starting (device=%s, offline=%s)", transcriber.device, transcriber.offline)
 
     try:
         speaker = create_speaker(backend=args.tts_backend, voice_dir=args.voice_dir, voice=args.voice)

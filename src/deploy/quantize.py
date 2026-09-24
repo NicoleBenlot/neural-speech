@@ -10,7 +10,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from src.inference.transcriber import _checkpoint_name, _checkpoint_root
+from src.inference.transcriber import DEFAULT_CHECKPOINT, _checkpoint_name, _checkpoint_root
 from src.models.stt import STTModel
 from src.training.checkpoint import CheckpointManager
 
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 def quantize_dynamic_checkpoint(
-    checkpoint: str = "checkpoints/latest",
+    checkpoint: str = DEFAULT_CHECKPOINT,
     output_dir: Optional[str] = None,
     dtype: torch.dtype = torch.qint8,
 ) -> Path:
@@ -82,7 +82,7 @@ def quantize_dynamic_checkpoint(
 
 
 def load_quantized_model(
-    checkpoint: str = "checkpoints/latest",
+    checkpoint: str = DEFAULT_CHECKPOINT,
     device: torch.device = torch.device("cpu"),
 ) -> tuple[STTModel, object, object]:
     """Load a previously quantized model with its tokenizer/config.

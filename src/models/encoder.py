@@ -17,6 +17,8 @@ Two encoders live here:
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -135,6 +137,8 @@ class MMSAudioEncoder(nn.Module):
         self,
         model_id: str = "facebook/mms-300m",
         unfreeze_layers: int = 4,
+        device: Optional[torch.device] = None,
+        local_files_only: bool = False,
     ):
         super().__init__()
         if unfreeze_layers < 0:
@@ -144,7 +148,11 @@ class MMSAudioEncoder(nn.Module):
 
         # Official MMS fine-tuning recipe: zero out all backbone dropout so the
         # frozen layers produce identical outputs in train and eval mode.
-        mms_config = Wav2Vec2Config.from_pretrained(model_id)
+        mms_config = Wav2Vec2Config.from_pretrained(
+            model_id,
+            use_safetensors=True,
+            local_files_only=local_files_only,
+        )
         mms_config.attention_dropout = 0.0
         mms_config.activation_dropout = 0.0
         mms_config.hidden_dropout = 0.0
@@ -154,7 +162,14 @@ class MMSAudioEncoder(nn.Module):
         mms_config.mask_time_prob = 0.0
 
         self.model_id = model_id
-        self.backbone = Wav2Vec2Model.from_pretrained(model_id, config=mms_config)
+        self.backbone = Wav2Vec2Model.from_pretrained(
+            model_id,
+            config=mms_config,
+            use_safetensors=True,
+            local_files_only=local_files_only,
+        )
+        if device is not None:
+            self.backbone.to(device)
 
         # Freeze everything, then unfreeze the last K transformer layers.
         self.backbone.requires_grad_(False)

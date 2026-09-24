@@ -35,6 +35,7 @@ import torch
 
 from src.data.audio import load_audio
 from src.data.parser import parse_index
+from src.inference.transcriber import DEFAULT_CHECKPOINT
 from src.models.stt import STTModel
 from src.training.checkpoint import CheckpointManager
 from src.training.metrics import compute_metrics, cer, wer
@@ -284,7 +285,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Encoder-collapse probe + greedy-decode holdout evaluation"
     )
-    parser.add_argument("--checkpoint", default="checkpoints/latest")
+    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--split", default="data/processed/split_manifest.json")
     parser.add_argument("--dataset", default="data/processed/manifest.csv")
     parser.add_argument("--device", default="auto")

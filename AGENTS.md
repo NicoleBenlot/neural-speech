@@ -106,6 +106,10 @@ list and what `--device auto` would select.
   raw int16 PCM (no RIFF header); `_merge_piper_chunks` wraps them. `piper-tts`
   installs on 3.14 via a cp39-abi3 wheel; `pyttsx3` falls back to OS voices.
   The `online` backend name is registered but unimplemented (edge-tts/Azure hook).
+- **Hugging Face inference cache**: MMS loading explicitly requests safetensors
+  and supports `--offline` on `ns.py mic` / standalone transcription. Set
+  `HF_HUB_OFFLINE=1` for repeated local runs after the backbone is cached; set
+  `HF_TOKEN` only when the Hugging Face repository requires authentication.
 
 ## Architecture (non-obvious)
 

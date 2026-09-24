@@ -1,6 +1,6 @@
 """One-shot deployment optimization entry point.
 
-python -m src.deploy.optimize --checkpoint checkpoints/latest
+python -m src.deploy.optimize --checkpoint checkpoints/mms/latest
 """
 
 from __future__ import annotations
@@ -10,13 +10,14 @@ import logging
 
 from src.deploy.quantize import quantize_dynamic_checkpoint
 from src.deploy.onnx_export import export_onnx, export_tensorrt
+from src.inference.transcriber import DEFAULT_CHECKPOINT
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Optimize a checkpoint for deployment")
-    parser.add_argument("--checkpoint", default="checkpoints/latest")
+    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--skip-quantization", action="store_true")
     parser.add_argument("--skip-onnx", action="store_true")
     parser.add_argument("--tensorrt", action="store_true", help="Also build a TensorRT engine (GPU only)")

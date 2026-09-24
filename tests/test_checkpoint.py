@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from src.inference.transcriber import DEFAULT_CHECKPOINT, _split_checkpoint
 from src.models.stt import STTConfig, STTModel
 from src.tokens.tokenizer import CharTokenizer
 from src.training.checkpoint import CheckpointManager, TrainingState
@@ -98,6 +99,12 @@ def test_resolve_latest(tmp_path):
     manager.save(model, opt, None, tok, config, state)
     resolved = manager.resolve("latest")
     assert resolved.name == "v001"
+
+
+def test_default_inference_checkpoint_uses_mms_line():
+    root, name = _split_checkpoint(DEFAULT_CHECKPOINT)
+    assert Path(root) == Path("checkpoints/mms")
+    assert name == "latest"
 
 
 def test_training_state_roundtrip():

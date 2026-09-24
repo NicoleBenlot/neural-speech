@@ -4,8 +4,8 @@ Usage:
     python ns.py prepare [--index data/raw/index.txt] [--output data/processed/manifest.csv]
     python ns.py validate [--fail-on-error]
     python ns.py train [--epochs 30] [--batch-size 8] [--device auto] ...
-    python ns.py transcribe <audio> [--checkpoint checkpoints/latest]
-    python ns.py optimize [--checkpoint checkpoints/latest]
+    python ns.py transcribe <audio> [--checkpoint checkpoints/mms/latest]
+    python ns.py optimize [--checkpoint checkpoints/mms/latest]
 
 Each subcommand forwards remaining arguments verbatim to the underlying
 src module, so every flag from `python -m src.<module>` works unchanged.
