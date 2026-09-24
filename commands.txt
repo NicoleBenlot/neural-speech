@@ -49,13 +49,21 @@ Sentences (this afternoon):
 5. python ns.py -m fb -c checkpoints/mms-sent -e 30 -b 10 -mtl 128 -d auto
    (VRAM: with long sentence audio on the 6GB GPU, drop to -b 8 / -b 4 if OOM)
 
-Checkpoints on your flash drive (D:):
-Copy-Item -Recurse checkpoints\mms "D:\neural-speech-checkpoints\mms"   # 3.1 GB
-# then use it from anywhere: python ns.py transcribe a.opus --checkpoint D:\neural-speech-checkpoints\mms\latest
-# continue training from the drive: python ns.py -m fb -c <line> --resume D:\neural-speech-checkpoints\mms\v026
+Flash drive sync (copy_repo.sh - two-way, skips .venv + caches, finds drive by label "KINGSTONE E"):
+bash copy_repo.sh                  # PUSH: repo -> D:\projects\neural-speech
+bash copy_repo.sh -r               # PULL: D:\projects\neural-speech -> PC (keeps local .venv)
+bash copy_repo.sh -p myfolder     # use <flash>/myfolder instead of "projects"
+bash copy_repo.sh -d "E:\x" [-r]   # manual base dir, either direction
+bash copy_repo.sh -f               # overwrite destination if it already exists
+# bash = Git for Windows (now on PATH: add 'C:\Program Files\Git\bin' to PATH or restart the terminal)
+# Use checkpoints straight off the drive:
+#   python ns.py transcribe a.opus --checkpoint D:\projects\neural-speech\checkpoints\mms\latest
+#   python ns.py -m fb -c <line> --resume D:\projects\neural-speech\checkpoints\mms\v026
 
 Run on another PC (torch lives in .venv, NOT in the repo / git):
-1. copy the repo folder but SKIP .venv/ and checkpoints/ (both git-ignored), or git clone it
+0. fastest: bash copy_repo.sh  -> flash, then on the other PC:  bash copy_repo.sh -r
+   (the flash copy already excludes .venv + caches and carries the checkpoints)
+1. or copy the repo folder SKIPPING .venv/ and caches (keep checkpoints/), or git clone it
 2. cd repo && python -m venv .venv && .venv\Scripts\activate
 3. pip install -r requirements.txt            # picks CPU torch; any PC works
 4. NVIDIA GPU there? then also:
