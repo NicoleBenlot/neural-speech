@@ -1,6 +1,8 @@
 [ab]
 abtik = 185
+abli = 198
 Abli ug sirado. = 259
+Abtik, dili tapulan. = 297
 
 [ad]
 adlaw = 104
@@ -57,6 +59,8 @@ basa = 148
 basin = 66
 bati = 134
 bayad = 183
+baligya = 201
+basa = 210
 Basin naa siya diri. = 246
 Baga ug nipis imong nawong. = 276
 Basa ug uga ang sinina. = 279
@@ -77,6 +81,7 @@ Bug-at ug gaan ang akoa. = 277
 Buotan ug malipayon. = 298
 
 [cl]
+close = 218
 Close ug save. = 270
 
 [da]
@@ -88,6 +93,8 @@ dalo = 159
 dapat = 55
 dayon = 113
 dayun = 21
+dala = 204
+dawat = 212
 Dali, lakaw adto nata. = 255
 Dako ug gamay ang tawo. = 273
 Dawat ug padala ang kwarta. = 267
@@ -98,7 +105,6 @@ dili = 51
 dinhi = 81
 diri = 80
 Dili ni mahimo. = 236
-Di ta pwede. = 263
 
 [du]
 dugay = 118
@@ -115,6 +121,7 @@ gabii = 102
 gahapon = 98
 gamay = 136
 ganahan = 57
+gawas = 197
 Ganahan ko sa sabaw. = 240
 Gahapon naa siya didto. = 250
 
@@ -132,6 +139,7 @@ Gwapo ug gwapa ang gagamit. = 272
 hain = 73
 hangtud = 16
 hapon = 101
+hatag = 202
 Hatag ug kuha. = 260
 
 [hi]
@@ -140,6 +148,7 @@ hinay = 153
 
 [hu]
 hugaw = 151
+hulat = 206
 
 [ib]
 ibabaw = 89
@@ -188,7 +197,6 @@ Kami naa diri sa among balay. = 239
 Kabalo ko nimo ug niya. = 241
 Kasabot ba ka nga ganahan ko nimo. = 242
 Karon naa siya diri. = 248
-Kapoy ko. = 300
 
 [ki]
 kilid = 93
@@ -205,11 +213,13 @@ Klaro ug tin-aw. = 289
 ko = 28
 komplikado = 179
 kon = 19
+Kapoy ko. = 300
 
 [ku]
 kulang = 161
 kung = 7
 kusog = 152
+kuha = 203
 Kusog ug hinay ang ulan. = 281
 
 [la]
@@ -246,11 +256,11 @@ minuto = 109
 
 [mo]
 mo = 30
-Murag maayo. = 247
 
 [mu]
 mubo = 138
 murag = 67
+Murag maayo. = 247
 
 [na]
 naa = 47
@@ -292,6 +302,9 @@ og = 4
 [oo]
 oo = 50
 
+[op]
+open = 217
+
 [or]
 oras = 108
 
@@ -301,6 +314,9 @@ palibut = 96
 panagsa = 117
 para = 10
 paspas = 154
+palit = 200
+pangita = 205
+padala = 213
 Paghinay lang, ayaw dagan. = 256
 Pangita ug pag hulat. = 262
 pagtudlo ug basa didto = 265
@@ -328,6 +344,9 @@ Puno ug kulang ang sabaw. = 285
 pwedi = 53
 Pwede ko mo sulod? = 234
 
+[re]
+reply = 215
+
 [sa]
 sa = 2
 sabaw = 49
@@ -338,6 +357,7 @@ sakto = 164
 samtang = 15
 sayon = 155
 sayop = 165
+save = 216
 Save ug open. = 269
 Sayon ug lisod sabton. = 283
 Sakto ug sayop akong tubag. = 287
@@ -356,6 +376,7 @@ sila = 27
 simple = 178
 siya = 26
 siyam = 128
+sirado = 199
 Siya kay naa diri. = 222
 Sila kay naa didto. = 223
 Siguro naa siya. = 244
@@ -367,6 +388,8 @@ Sobra ug igo ang akong kwarta = 286
 [su]
 subra = 162
 sunod = 70
+sulod = 196
+sulat = 211
 Sulod ug gawas. = 258
 Sulat ug basa = 266
 Sunod dayon. = 251
@@ -377,6 +400,8 @@ taas = 137
 tagpila = 79
 tapad = 95
 tapulan = 186
+tabang = 207
+tawag = 214
 Tabang! Di ta pwede. = 263
 Tawag ug reply sa ako nga mensahe = 268
 Taas ug mubo ang tawo. = 274
@@ -388,12 +413,16 @@ tinuod = 166
 Tingali naa sila didto. = 245
 Tinuod, dili bakak ang akong gi ingon. = 288
 
+[tr]
+trabaho = 208
+
 [tu]
 tugnaw = 147
 tuig = 107
 tulo = 122
 tunga = 94
 tungod = 13
+tudlo = 209
 
 [ub]
 ubos = 90

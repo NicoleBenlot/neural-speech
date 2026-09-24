@@ -50,6 +50,12 @@ def _invoke(module_main, argv: list) -> int:
 
 
 def main() -> int:
+    raw_args = sys.argv[1:]
+    if raw_args and raw_args[0] not in COMMANDS and (
+        "-m" in raw_args or "--model-backbone" in raw_args
+    ):
+        raw_args = ["train", *raw_args]
+
     parser = argparse.ArgumentParser(
         prog="ns",
         description="Universal neural-speech CLI",
@@ -60,7 +66,7 @@ def main() -> int:
         nargs="?",
         help="subcommand: " + ", ".join(sorted(COMMANDS)),
     )
-    args, rest = parser.parse_known_args()
+    args, rest = parser.parse_known_args(raw_args)
 
     wants_help = args.command in (None, "-h", "--help", "help") or any(
         flag in rest for flag in ("-h", "--help")
