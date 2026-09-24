@@ -219,9 +219,19 @@ def print_probe_report(
     print(f"verdict: {verdict}")
 
 
-def run_holdout_greedy(model, tokenizer, rows, device) -> None:
+def run_holdout_greedy(model, tokenizer, rows, device, by_type=False) -> None:
     print("\n=== Greedy-decode holdout table ===")
-    refs, hyps = [], []
+    refs_by_id = {r["id"]: r["text"] for r in rows}
+    hyps_by_id = {}
+
+    def _aggregate(sub_rows, label):
+        if not sub_rows:
+            return
+        refs = [refs_by_id[r["id"]] for r in sub_rows]
+        hyps = [hyps_by_id[r["id"]] for r in sub_rows]
+        agg = compute_metrics(refs, hyps)
+        print(f"[{label}] n={len(sub_rows)}: CER={agg.cer:.4f} WER={agg.wer:.4f}")
+
     for i, r in enumerate(rows):
         result = load_audio(r["audio_path"], target_sr=16000)
         audio = result.waveform.unsqueeze(0).to(device)
@@ -229,13 +239,14 @@ def run_holdout_greedy(model, tokenizer, rows, device) -> None:
         with torch.no_grad():
             ids = model.decode(audio, lengths, beam_size=1)[0]
         hyp = tokenizer.decode(ids)
+        hyps_by_id[r["id"]] = hyp
         ref = r["text"]
-        refs.append(ref)
-        hyps.append(hyp)
         print(f"{r['id']:>6} | ref: {ref:<12} | hyp: {hyp:<12} | CER {cer(ref, hyp):.3f} | WER {wer(ref, hyp):.3f}")
 
-    agg = compute_metrics(refs, hyps)
-    print(f"\naggregate over {len(rows)} held-out clips: CER={agg.cer:.4f} WER={agg.wer:.4f}")
+    _aggregate(rows, "all")
+    if by_type:
+        _aggregate([r for r in rows if " " not in r["text"]], "word  ")
+        _aggregate([r for r in rows if " " in r["text"]], "sentence")
 
 
 def _print_model_size(model: STTModel, checkpoint: str):
@@ -295,6 +306,11 @@ def main():
         action="store_true",
         help="Probe the fresh pretrained backbone (ignore trained weights).",
     )
+    parser.add_argument(
+        "--by-type",
+        action="store_true",
+        help="Also print aggregate CER/WER split by word vs sentence clips.",
+    )
     args = parser.parse_args()
 
     device = resolve_device(args.device)
@@ -310,7 +326,7 @@ def main():
     print(f"(frame-sequence probe uses first {max_frames} frames per clip)")
     print_probe_report(cos_pooled, cos_seq, pooled, rows, label)
     if not args.untrained:
-        run_holdout_greedy(model, tokenizer, rows, device)
+        run_holdout_greedy(model, tokenizer, rows, device, by_type=args.by_type)
     _print_model_size(model, args.checkpoint)
     return 0
 

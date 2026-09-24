@@ -51,8 +51,16 @@ def _invoke(module_main, argv: list) -> int:
 
 def main() -> int:
     raw_args = sys.argv[1:]
+    _TRAIN_FLAGS = {
+        "-new", "--new", "-continue", "--continue", "-resume", "--resume",
+        "-m", "--model-backbone", "-c", "--checkpoint-dir",
+        "-e", "--epochs", "-b", "--batch-size", "-d", "--device",
+        "--dataset", "--replay-manifest", "--from-checkpoint",
+    }
     if raw_args and raw_args[0] not in COMMANDS and (
-        "-m" in raw_args or "--model-backbone" in raw_args
+        raw_args[0] in _TRAIN_FLAGS
+        or "-m" in raw_args
+        or "--model-backbone" in raw_args
     ):
         raw_args = ["train", *raw_args]
 

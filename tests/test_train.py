@@ -5,9 +5,17 @@ from pathlib import Path
 import pytest
 import torch
 
-from src.training.train import _BACKBONE_ALIASES, build_arg_parser, TrainConfig, Trainer, set_seed
+from src.training.train import (
+    _BACKBONE_ALIASES,
+    _apply_mode_defaults,
+    build_arg_parser,
+    TrainConfig,
+    Trainer,
+    set_seed,
+)
 from src.training.checkpoint import CheckpointManager
 from src.models.stt import STTConfig
+from src.data.dataset import manifest_fingerprint, split_fingerprint
 
 
 def _tiny_model_config():
@@ -124,3 +132,91 @@ def test_backbone_aliases_all_map_to_mms():
     assert _BACKBONE_ALIASES["mms"] == "facebook/mms-300m"
     assert _BACKBONE_ALIASES["mms-300m"] == "facebook/mms-300m"
     assert "none" not in _BACKBONE_ALIASES
+
+
+def test_mode_flag_parsing():
+    parser = build_arg_parser()
+
+    a = parser.parse_args(["-new", "-d", "auto"])
+    assert a.new is True
+    assert a.resume is None
+    assert getattr(a, "continue") is None
+
+    c = parser.parse_args(["-continue", "-d", "auto", "-e", "30", "-b", "8"])
+    assert getattr(c, "continue") == "best"
+
+    c2 = parser.parse_args(["-continue", "latest"])
+    assert getattr(c2, "continue") == "latest"
+
+    r = parser.parse_args(["-resume"])
+    assert r.resume == "_AUTO_"
+    r2 = parser.parse_args(["-resume", "v001"])
+    assert r2.resume == "v001"
+
+    assert parser.parse_args(["-new"]).model_backbone == "fb"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["-new", "-continue", "best"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["-resume", "v001", "--from-checkpoint", "v002"])
+
+
+def test_apply_continue_defaults_wires_replay_and_regression(base_config, tmp_path):
+    config = dict(base_config)
+    config["epochs"] = 1
+    set_seed(2)
+    Trainer(TrainConfig(**config)).train()
+
+    new_data = tmp_path / "other" / "manifest.csv"
+    cfg = TrainConfig(
+        **dict(
+            config,
+            continue_mode="best",
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            dataset=str(new_data),
+        )
+    )
+    out = _apply_mode_defaults(cfg)
+
+    assert Path(out.from_checkpoint).name == "v001"
+    assert out.continue_mode is None
+    assert out.replay_manifest == config["dataset"]
+    assert out.eval_manifest == config["dataset"]
+    assert out.replay_ratio == 0.3
+
+
+def test_changed_manifest_resplits_on_continue(base_config, tmp_path):
+    config = dict(base_config)
+    config["epochs"] = 1
+    set_seed(1)
+    Trainer(TrainConfig(**config)).train()
+
+    split_file = Path(config["split_dir"]) / "split_manifest.json"
+    assert split_file.exists()
+
+    # A new manifest sharing the same stem (new data, more samples reusing the
+    # same audio assets) -> different fingerprint -> the old split must be
+    # discarded and rebuilt from the current manifest.
+    old_manifest = Path(config["dataset"])
+    assets = old_manifest.parent / "assets"
+    other = tmp_path / "other"
+    other.mkdir(exist_ok=True)
+    words = ["adlaw", "adto", "ako", "akong", "amo", "amo", "akong"]
+    rows = []
+    for i, word in enumerate(words):
+        wid = 300 + i
+        rows.append(f"{wid},{assets / f'{100 + i % 5}.wav'},{word},ad")
+    new_manifest = other / "manifest.csv"
+    new_manifest.write_text(
+        "id,audio,text,section\n" + "\n".join(rows), encoding="utf-8"
+    )
+    assert manifest_fingerprint(new_manifest) != manifest_fingerprint(old_manifest)
+
+    resume_config = dict(config, dataset=str(new_manifest), resume="v001")
+    trainer = Trainer(TrainConfig(**resume_config))
+    train_ds, valid_ds, test_ds, _ = trainer._load_datasets()
+
+    # 7 rows -> 5 train (80%); the stale 4-row train split must NOT be reused,
+    # and the split file must be rewritten against the new manifest.
+    assert len(train_ds) == 5
+    assert split_fingerprint(split_file) == manifest_fingerprint(new_manifest)

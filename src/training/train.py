@@ -20,9 +20,12 @@ from src.data.dataset import (
     SpeechDataset,
     collate_speech,
     load_split,
+    manifest_fingerprint,
     read_manifest,
     save_split,
     split_dataset,
+    split_fingerprint,
+    split_row_counts,
     _rows_to_dataset,
 )
 from src.data.prepare import write_manifest
@@ -74,6 +77,8 @@ class TrainConfig:
     beam_size: int = 5
     retain_every: int = 10
     retain_protect: List[str] = field(default_factory=list)
+    new_run: bool = False
+    continue_mode: Optional[str] = None
     model: STTConfig = field(default_factory=STTConfig)
 
     sample_rate: int = 16000
@@ -99,6 +104,16 @@ class Trainer:
     def _validate_training_args(self):
         if self.config.resume and self.config.from_checkpoint:
             raise ValueError("Use either --resume or --from-checkpoint, not both.")
+        modes = (
+            self.config.new_run,
+            self.config.continue_mode is not None,
+            bool(self.config.resume),
+            bool(self.config.from_checkpoint),
+        )
+        if sum(modes) > 1:
+            raise ValueError(
+                "Use only one of -new, -continue, --resume, or --from-checkpoint."
+            )
 
     def _prepare_epoch_from_checkpoint(self):
         """For incremental training, build tokenizer/vocab from the parent vocab plus new data."""
@@ -126,8 +141,10 @@ class Trainer:
 
         new_run = not self.config.resume and not self.config.from_checkpoint
 
+        rows = read_manifest(manifest)
+        current_fp = manifest_fingerprint(manifest)
+
         if new_run:
-            rows = read_manifest(manifest)
             self.tokenizer = CharTokenizer()
             self.tokenizer.build_from_texts([r.text for r in rows])
             if self.config.model.head == "ctc":
@@ -135,7 +152,10 @@ class Trainer:
             train_rows, valid_rows, test_rows = split_dataset(
                 rows, seed=self.config.seed
             )
-            save_split(split_file, train_rows, valid_rows, test_rows, self.config.seed)
+            save_split(
+                split_file, train_rows, valid_rows, test_rows,
+                self.config.seed, fingerprint=current_fp,
+            )
             train_ds = _rows_to_dataset([r.__dict__ for r in train_rows], self.tokenizer, self.config.sample_rate)
             valid_ds = _rows_to_dataset([r.__dict__ for r in valid_rows], self.tokenizer, self.config.sample_rate)
             test_ds = _rows_to_dataset([r.__dict__ for r in test_rows], self.tokenizer, self.config.sample_rate)
@@ -144,13 +164,33 @@ class Trainer:
                 ckpt = self.config.resume or self.config.from_checkpoint
                 self.tokenizer = self.manager.load(ckpt)["tokenizer"]
 
+            reused = False
             if split_file.exists():
-                train_ds, valid_ds, test_ds = load_split(
-                    split_file, self.tokenizer, self.config.sample_rate
+                saved_fp = split_fingerprint(split_file)
+                if saved_fp is not None:
+                    stale = saved_fp != current_fp
+                else:
+                    stale = sum(split_row_counts(split_file)) != len(rows)
+                if not stale:
+                    train_ds, valid_ds, test_ds = load_split(
+                        split_file, self.tokenizer, self.config.sample_rate
+                    )
+                    reused = True
+                else:
+                    logger.warning(
+                        "Split %s was built from different data (manifest changed); "
+                        "re-splitting from the current manifest.",
+                        split_file,
+                    )
+
+            if not reused:
+                train_rows, valid_rows, test_rows = split_dataset(
+                    rows, seed=self.config.seed
                 )
-            else:
-                rows = read_manifest(manifest)
-                train_rows, valid_rows, test_rows = split_dataset(rows, seed=self.config.seed)
+                save_split(
+                    split_file, train_rows, valid_rows, test_rows,
+                    self.config.seed, fingerprint=current_fp,
+                )
                 train_ds = _rows_to_dataset([r.__dict__ for r in train_rows], self.tokenizer, self.config.sample_rate)
                 valid_ds = _rows_to_dataset([r.__dict__ for r in valid_rows], self.tokenizer, self.config.sample_rate)
                 test_ds = _rows_to_dataset([r.__dict__ for r in test_rows], self.tokenizer, self.config.sample_rate)
@@ -348,6 +388,11 @@ class Trainer:
                         "replay_manifest": self.config.replay_manifest,
                         "replay_ratio": self.config.replay_ratio,
                     }
+                )
+                self.manager.update_best(
+                    self.state,
+                    self.config.dataset,
+                    manifest_fingerprint(Path(self.config.dataset)),
                 )
                 self.last_saved = True
                 self._prune_checkpoints()
@@ -658,6 +703,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train or continue training the STT model"
     )
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
+        "-new",
+        "--new",
+        action="store_true",
+        help="Start a fresh run from scratch on the current dataset "
+        "(rebuilds tokenizer and splits).",
+    )
+    modes.add_argument(
+        "-continue",
+        "--continue",
+        nargs="?",
+        const="best",
+        choices=["best", "latest"],
+        metavar="SOURCE",
+        help="Continue from an existing checkpoint line onto the current dataset. "
+        "SOURCE selects the parent version: 'best' (lowest validation_loss, "
+        "default) or 'latest'. Fresh optimizer; auto-wires replay + regression "
+        "eval from the parent's dataset manifest.",
+    )
+    modes.add_argument(
+        "--resume",
+        "-resume",
+        nargs="?",
+        const="_AUTO_",
+        default=None,
+        metavar="CHECKPOINT",
+        help="Continue the same run/state (optimizer+scheduler+epoch restored). "
+        "With no value, auto-resolves checkpoints/<newest-line>/latest; otherwise "
+        "a version dir or path like checkpoints/mms/latest.",
+    )
+    modes.add_argument(
+        "--from-checkpoint",
+        default=None,
+        metavar="CHECKPOINT",
+        help="Incremental: load weights/vocab/arch from an existing checkpoint, "
+        "start a fresh optimizer and record parent_checkpoint.",
+    )
     parser.add_argument("--dataset", default="data/processed/manifest.csv")
     parser.add_argument("-b", "--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -666,12 +749,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("-d", "--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("-c", "--checkpoint-dir", default="checkpoints")
+    parser.add_argument(
+        "-c",
+        "--checkpoint-dir",
+        default=None,
+        help="Checkpoint line to read from/write to. Continue/resume auto-detect the "
+        "newest line under checkpoints/ when omitted.",
+    )
     parser.add_argument("--validation-frequency", type=int, default=1)
     parser.add_argument("--replay-ratio", type=float, default=0.0)
     parser.add_argument("--replay-manifest", default=None)
-    parser.add_argument("--resume", default=None)
-    parser.add_argument("--from-checkpoint", default=None)
     parser.add_argument("--eval-manifest", default=None)
     parser.add_argument("--no-fp16", action="store_true", help="Disable mixed precision")
     parser.add_argument("--split-dir", default="data/processed")
@@ -691,11 +778,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-m",
         "--model-backbone",
-        default="none",
+        default="fb",
         help="Pretrained acoustic backbone. 'none' = from-scratch encoder. "
         "E.g. 'facebook/mms-300m' (hidden 1024, 24 layers, ~315M params, "
         "self-supervised on 1,406 languages incl. ceb). Aliases: 'fb'/'mms' "
-        "= facebook/mms-300m.",
+        "= facebook/mms-300m. Default 'fb' (the previously used model).",
     )
     parser.add_argument(
         "--backbone-unfreeze-layers",
@@ -721,6 +808,110 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "Repeatable. Independent of the milestone/best/final keep-set.",
     )
     return parser
+
+
+def _detect_checkpoint_line(checkpoint_dir: Optional[str]) -> Path:
+    """Resolve the checkpoint line to operate on.
+
+    An explicit ``--checkpoint-dir`` is used as-is (must exist). Otherwise the
+    newest line under ``checkpoints/`` (a subdir holding a ``latest.json``) is
+    auto-detected.
+    """
+    if checkpoint_dir:
+        line = Path(checkpoint_dir)
+        if not line.is_dir():
+            raise FileNotFoundError(f"Checkpoint line not found: {line}")
+        return line
+    base = Path("checkpoints")
+    if not base.is_dir():
+        raise FileNotFoundError(
+            "No checkpoints/ directory found; pass --checkpoint-dir or run -new first."
+        )
+    lines = [
+        p for p in base.iterdir() if p.is_dir() and (p / "latest.json").exists()
+    ]
+    if not lines:
+        raise FileNotFoundError(
+            "No checkpoint line found under checkpoints/ (a subdir with latest.json). "
+            "Run with -new once first, or pass --checkpoint-dir explicitly."
+        )
+    newest = max(lines, key=lambda p: (p / "latest.json").stat().st_mtime)
+    logger.info("Auto-detected newest checkpoint line: %s", newest)
+    return newest
+
+
+def _best_version_dir(manager: CheckpointManager) -> Path:
+    """Pick the parent version for -continue: lowest validation_loss, latest as fallback."""
+    versions = manager.versions()
+    if not versions:
+        raise FileNotFoundError(f"No checkpoint versions under {manager.root}")
+    measured = [
+        v
+        for v in versions
+        if manager.version_metrics(v).get("validation_loss", 0.0) > 0.0
+    ]
+    best = (
+        min(measured, key=lambda v: manager.version_metrics(v)["validation_loss"])
+        if measured
+        else max(versions)
+    )
+    logger.info("Parent for -continue: v%03d (best by validation_loss)", best)
+    return manager.version_dir(best)
+
+
+def _apply_mode_defaults(config: TrainConfig) -> TrainConfig:
+    """Resolve the abbreviated mode flags into concrete targets.
+
+    -new is a plain fresh run (no resolution needed). -continue resolves a
+    parent checkpoint (best/latest) and auto-wires replay + regression eval
+    from the parent's dataset manifest. A bare -resume resolves to the
+    newest line's latest version.
+    """
+    if config.continue_mode:
+        line = _detect_checkpoint_line(config.checkpoint_dir)
+        if not config.checkpoint_dir:
+            config.checkpoint_dir = str(line)
+        manager = CheckpointManager(config.checkpoint_dir)
+        parent = (
+            _best_version_dir(manager)
+            if config.continue_mode == "best"
+            else manager.resolve("latest")
+        )
+        config.from_checkpoint = str(parent)
+        config.continue_mode = None
+
+        parent_dataset = manager.load(str(parent))["manifest"].get("dataset")
+        if parent_dataset:
+            p = Path(parent_dataset)
+            if p.exists() and p.resolve() != Path(config.dataset).resolve():
+                if not config.replay_manifest:
+                    config.replay_manifest = str(p)
+                    if config.replay_ratio == 0.0:
+                        config.replay_ratio = 0.3
+                if not config.eval_manifest:
+                    config.eval_manifest = str(p)
+                logger.info(
+                    "-continue: parent data %s reused for replay (ratio %.2f) and "
+                    "regression eval",
+                    p,
+                    config.replay_ratio,
+                )
+            elif not p.exists():
+                logger.info(
+                    "-continue: parent dataset %s not found; skipping replay/regression",
+                    p,
+                )
+            else:
+                logger.info(
+                    "-continue: parent dataset is the current dataset; no replay needed"
+                )
+    elif config.resume == "_AUTO_":
+        line = _detect_checkpoint_line(config.checkpoint_dir)
+        if not config.checkpoint_dir:
+            config.checkpoint_dir = str(line)
+        config.resume = str(CheckpointManager(config.checkpoint_dir).resolve("latest"))
+
+    return config
 
 
 def main():
@@ -759,8 +950,14 @@ def main():
         beam_size=args.beam_size,
         retain_every=args.retain_every,
         retain_protect=args.retain_protect,
+        new_run=args.new,
+        continue_mode=getattr(args, "continue"),
         model=model_config,
     )
+
+    config = _apply_mode_defaults(config)
+    if config.checkpoint_dir is None:
+        config.checkpoint_dir = "checkpoints"
 
     trainer = Trainer(config)
     trainer.train()

@@ -4,9 +4,15 @@ NOTES TO KNOW BEFOREHAND:
 - Always use the VENV python (.venv\Scripts\python.exe), never the base D:\python one.
   venv has the GPU torch (cu130); base D:\python has the old CPU build.
 - -d auto picks CUDA -> MPS -> CPU for you; fp16 AMP turns itself ON for CUDA.
-- Checkpoints auto-prune after every saved epoch: keep = final + best-val-loss + every Nth
-  (--retain-every 10 default). Pass --retain-every 0 to disable, --retain-protect vNNN to pin.
-  resume only works from a KEPT version. Never save into an existing version dir.
+- Checkpoints auto-prune after every saved epoch: keep = recorded best (best.json)
+  + final + best-val-loss + every Nth (--retain-every 10 default). Pass --retain-every 0
+  to disable, --retain-protect vNNN to pin. resume only works from a KEPT version.
+  Never save into an existing version dir.
+- latest != best: latest.json = most recent epoch, best.json = best validation
+  performance. best.json tracks both val_loss-min and CER-min independently
+  (dataset-aware, can't be shadowed by an older dataset's lower val_loss); prune
+  protects both. Use `best` anywhere a checkpoint is accepted: -resume best,
+  --from-checkpoint best, --checkpoint checkpoints/mms/best.
 - Checkpoints/mms now holds ONLY v026 (best) + v030 (final) = 3.1 GB. Weights are never in git.
 - index.txt now supports SENTENCES: "ang bata nagdula sa bola = 196" (multi-word OK, id = filename).
 - No audio-length cap; only --max-text-len (default 64) limits decode. Long sentences: raise to 128.
@@ -17,35 +23,36 @@ NOTES TO KNOW BEFOREHAND:
 - bash = Git for Windows. New terminals pick it up (C:\Program Files\Git\bin added to user PATH).
 - Flash drive D: = "KINGSTONE E". copy_repo.sh pushes/pulls the repo (skips .venv + caches).
   Off-site alternative if you ever need version history: DVC/cloud with the same keep-set policy.
-- NEVER combine --resume and --from-checkpoint.
+- The 3 training modes are mutually exclusive: pick ONE of -new / -continue / -resume (never combine).
 
 Data prep:
 python ns.py prepare                          # index.txt -> data/processed/manifest.csv
 python ns.py validate --fail-on-error         # dataset checks
 
-Train (short flags; -d auto picks CUDA -> MPS -> CPU):
-python ns.py -m fb -c checkpoints/mms-sent -e 30 -b 10 -mtl 123 -d auto
-python ns.py train                            # full long-form flags, defaults
-python ns.py train --help                     # full flag list
+Train - three modes, always pick exactly ONE (-d auto picks CUDA -> MPS -> CPU):
+python ns.py train -new -d auto -e 30               # 1) FRESH RUN on current data (rebuilds tokenizer + splits)
+python ns.py train -continue -d auto -e 30          # 2) CONTINUE from BEST val-loss version onto NEW data (auto replay + regression)
+python ns.py train -continue latest -d auto -e 30   #    same, but parent = newest version
+python ns.py train -resume -d auto -e 30            # 3) RESUME the SAME run/data (optimizer/scheduler/epoch/RNG); auto = newest line's latest
+python ns.py train -resume <version-or-path> ...    #    explicit resume target (e.g. v026 or checkpoints/mms/v026)
+python ns.py train --from-checkpoint <dir> ...      #    manual incremental parent (no auto-wiring)
+python ns.py train --help                           # full flag list
 
-Train long-form (equivalent, with extras):
-python ns.py --model-backbone facebook/mms-300m --backbone-unfreeze-layers 4 `
-  --checkpoint-dir checkpoints/mms-sent --epochs 30 --learning-rate 3e-4 `
-  --batch-size 8 --max-text-len 128 --device cuda
+Handled for you automatically (no typing needed):
+- no -m  -> fb (facebook/mms-300m). Pass -m none for a from-scratch encoder.
+- no -c  -> -continue/-resume auto-detect the newest line under checkpoints/ (yours = checkpoints/mms).
+- -continue auto-wires --replay-manifest + --eval-manifest from the parent's dataset (ratio 0.3).
+- Stale split_*.json files are auto-detected (manifest SHA-256 fingerprint) and re-split when data changes.
+- -b defaults to 8; drop to 4-6 on the 6GB GPU if OOM. Pick -e to control run length.
+
+Always-available train flags (long form still works):
+--dataset <csv> -b/--batch-size -e/--epochs -d/--device -mtl/--max-text-len
+--retain-every N (prune interval; 0 = keep all)   --retain-protect vNNN (pin a version)
+--replay-manifest <csv> --replay-ratio 0.3        --eval-manifest <old-csv> (regression)
 
 Short-flag map: -m model backbone (fb/mms/mms-300m = facebook/mms-300m; none = from scratch)
                  -c checkpoint dir (writable line, e.g. checkpoints/mms-sent)
                  -e epochs   -b batch size   -mtl max text len   -d device (auto|cuda|cpu)
-
-Continue the existing MMS line (resume optimizer/Scheduler/epoch/RNG):
-python ns.py -m fb -c checkpoints/mms --resume checkpoints/mms
-
-Resume / safety flags:
---resume <dir>            restores optimizer/scheduler/epoch/RNG from a kept version
---from-checkpoint <dir>   incremental: fresh optimizer, records parent_checkpoint
---eval-manifest <old-csv> regression eval vs. previous data
---retain-every 10         checkpoint auto-pruning (0 = keep all). Default 10.
---retain-protect vNNN     never delete this version (repeatable)
 
 Inference:
 python ns.py transcribe <audio> --checkpoint checkpoints/mms-sent/latest --device cuda
@@ -58,15 +65,17 @@ python ns.py optimize                         # INT8 quant + ONNX export
 python ns.py devices                          # detect compute devices
 python ns.py devices --check cuda             # resolve a device string
 uvicorn src.api.main:app --port 8000          # FastAPI
-python -m pytest tests -q                     # 98 tests
+python -m pytest tests -q                     # 107 tests
 
 Sentences (this afternoon):
 1. Put sentence audio in data/raw/assets/ as <id>.opus
 2. Add lines to data/raw/index.txt:  sentence text = <id>
 3. python ns.py prepare
 4. python ns.py validate --fail-on-error
-5. python ns.py -m fb -c checkpoints/mms-sent -e 30 -b 10 -mtl 128 -d auto
+5. python ns.py train -new -c checkpoints/mms-sent -e 30 -b 10 -mtl 128 -d auto
    (VRAM: with long sentence audio on the 6GB GPU, drop to -b 8 / -b 4 if OOM)
+   ...or later, once checkpoints/mms-sent exists, keep training it with:
+   python ns.py train -continue -c checkpoints/mms-sent -e 30 -mtl 128 -d auto
 
 Flash drive sync (copy_repo.sh - two-way, skips .venv + caches, finds drive by label "KINGSTONE E"):
 bash copy_repo.sh                  # PUSH: repo -> D:\projects\neural-speech
@@ -77,7 +86,7 @@ bash copy_repo.sh -f               # overwrite destination if it already exists
 # bash = Git for Windows (now on PATH: add 'C:\Program Files\Git\bin' to PATH or restart the terminal)
 # Use checkpoints straight off the drive:
 #   python ns.py transcribe a.opus --checkpoint D:\projects\neural-speech\checkpoints\mms\latest
-#   python ns.py -m fb -c <line> --resume D:\projects\neural-speech\checkpoints\mms\v026
+#   python ns.py train -resume D:\projects\neural-speech\checkpoints\mms\v026 ...
 
 Run on another PC (torch lives in .venv, NOT in the repo / git):
 0. fastest: bash copy_repo.sh  -> flash, then on the other PC:  bash copy_repo.sh -r

@@ -9,6 +9,10 @@ by running the commands in this environment (Windows, PowerShell).
 python ns.py prepare                        # index.txt -> data/processed/manifest.csv
 python ns.py validate --fail-on-error       # dataset checks; exits 1 on errors
 python ns.py train                          # train; see flags below
+python ns.py train -new -d auto -e 30       # fresh run on current manifest.csv (backbone defaults to fb)
+python ns.py train -continue -d auto -e 30  # continue from best version onto new data (auto replay + regression)
+python ns.py train -continue latest ...     # same, but parent = newest version
+python ns.py train -resume -d auto -e 30    # same-run resume: auto-resolves checkpoints/<newest-line>/latest
 python ns.py transcribe <audio> --checkpoint checkpoints/latest
 python ns.py mic --seconds 5                # record mic + transcribe (real-time test)
 python ns.py mic --loop --seconds 3         # keep going until Ctrl+C
@@ -23,7 +27,7 @@ python -m src.training.train
 python -m src.inference.transcriber <audio> --checkpoint checkpoints/latest
 python -m src.deploy.optimize
 uvicorn src.api.main:app --port 8000        # FastAPI (model loaded once at startup)
-python -m pytest tests -q                   # 85 tests; no real dataset needed
+python -m pytest tests -q                   # 107 tests; no real dataset needed
 ```
 
 `ns.py` is a shell-agnostic wrapper: it forwards all subcommand args verbatim to the
@@ -36,19 +40,44 @@ name to `(module_main, one-line_help)`. Adding a new command means only: add an 
 `python -m src.<module>` work), and it shows up automatically in `python ns.py help`.
 Args are forwarded raw — parser options live in the target module's argparse, not `ns.py`.
 
-Training flags that matter: `--resume <dir>` (restores optimizer/scheduler/epoch/RNG),
-`--from-checkpoint <dir>` (incremental: fresh optimizer, records `parent_checkpoint`),
-`--replay-manifest <csv> --replay-ratio 0.3`, `--eval-manifest <old-csv>` (regression eval).
-Never combine `--resume` and `--from-checkpoint`.
+Training modes (mutually exclusive, `ns.py train --help` for full flag list):
+- `-new` — fresh run on the current `--dataset` (rebuilds tokenizer + splits, overwrites stale
+  split files). No `-m` defaults to `fb`.
+- `-continue [best|latest]` — incremental continuation onto the current dataset: parent is the
+  lowest-`validation_loss` version (default) or `latest`; fresh optimizer, records
+  `parent_checkpoint`, and auto-wires `--replay-manifest`/`--eval-manifest` from the parent's
+  stored dataset manifest when it differs from the current one (ratio 0.3).
+- `-resume [<checkpoint>]` — same-run continuation (restores optimizer/scheduler/epoch/RNG).
+  Bare `-resume` auto-resolves `checkpoints/<newest-line>/latest`.
+- `--from-checkpoint <dir>` — explicit incremental parent (no auto-wiring).
+When `-c`/`--checkpoint-dir` is omitted, `-continue`/`-resume` auto-detect the newest line
+under `checkpoints/` (a subdir holding `latest.json`); `-new` defaults to `checkpoints`.
+`CheckpointManager.resolve` also accepts a line root (e.g. `checkpoints/mms`) and resolves it
+to that line's latest version. Never combine resume modes with each other.
 
 ## Checkpoint retention policy (STRICT — to keep repo size down)
 
 Checkpoints are the only large artifact (a 30-epoch MMS run ≈ 46.5 GB). Policy,
 enforced by the trainer's auto-prune (default ON):
 
-- Keep **only**: the best version by `validation_loss` (flag 'best'), the **final**
-  version (newest, `latest.json` stays valid), and **every Nth version** for trend
+- Keep **only**: the recorded best (`best.json`, maintained by `update_best`), the
+  best version by on-disk `validation_loss` (flag 'best'), the **final** version
+  (newest, `latest.json` stays valid), and **every Nth version** for trend
   visibility — `--retain-every N` (default **10**; 0 = disable pruning, keep all).
+- **`latest` ≠ `best`**: `latest.json` points at the most recent epoch; `best.json`
+  at the best validation performance. Both survive pruning independently.
+  `CheckpointManager.resolve`/`load` accept `best` / `checkpoints/mms/best`
+  (works for `--resume best`, `--from-checkpoint best`, `--checkpoint .../best`).
+- `update_best` is called by the trainer after every validated save and is
+  **dataset-aware**: each `best.json` entry stores the manifest path + SHA-256
+  fingerprint. Two minima are tracked independently — `val_loss` (canonical,
+  drives the LR scheduler) and `cer` (CER and val_loss can peak at different
+  epochs, e.g. the first combined run: val_loss best ~epoch 20, CER best
+  ~epoch 28). On a fingerprint mismatch both entries are reset immediately, so
+  an old dataset's lower val_loss never shadows a newer run's best and lets the
+  interval pruner delete it — which is exactly what happened to the first
+  combined word+sentence run (its best ~epoch 26-28 was deleted; only
+  milestones + the old parent survived).
 - `--retain-protect v026` (repeatable) adds any version that must never be deleted,
   regardless of the keep-set (e.g. published reference points).
 - Pruning runs automatically after every validated checkpoint save and again at the
@@ -119,9 +148,12 @@ list and what `--device auto` would select.
   `max_len` is reached).
 - Data flow: `index.txt` (immutable) -> `manifest.csv` (derived) -> PyTorch Dataset ->
   model. Splits are persisted to `data/processed/split_<manifest_stem>.json` and
-  reused on resume so evaluation sets stay stable. Character tokenizer special tokens
-  are at fixed indices 0-3 (PAD/UNK/BOS/EOS); vocabulary is saved per checkpoint
-  version.
+  reused on resume/continue so evaluation sets stay stable. Each split stores a SHA-256
+  fingerprint of the manifest it was built from: if the manifest changed (new data),
+  resume/continue detect it (fingerprint mismatch; legacy splits fall back to a row-count
+  comparison) and re-split + overwrite with a warning instead of silently training on
+  stale rows. Character tokenizer special tokens are at fixed indices 0-3 (PAD/UNK/BOS/EOS);
+  vocabulary is saved per checkpoint version.
 - `Transcriber` (used by both the standalone CLI and FastAPI) loads vocabulary +
   config from the checkpoint itself — never duplicate preprocessing in new inference
   code.
@@ -147,13 +179,15 @@ list and what `--device auto` would select.
 
 ## Environment
 
-- This machine has an NVIDIA GeForce RTX 3050 6GB (compute 8.6). The project
-  venv (`.\venv\Scripts\python.exe`) carries `torch 2.14.0+cu130` /
-  `torchaudio 2.11.0+cu130` (installed from the `cu130` wheel index), which
-  shadow the CPU build still present inside the base `D:\python` distribution
-  — venv site-packages precedes the `base_site.pth` path, so always run via
-  the venv python. `--device auto` now lands on CUDA, and fp16 AMP
-  (autocast + `torch.amp.GradScaler("cuda", ...)`) turns on automatically for
+- This machine has an NVIDIA GeForce RTX 3050 6GB (compute 8.6). Python is a
+  native user install (3.14.7, `winget install Python.Python.3.14`, at
+  `%LOCALAPPDATA%\Programs\Python\Python314\`) and `python` on PATH resolves to
+  it ahead of the MS Store alias. It carries `torch 2.14.0+cu130` /
+  `torchaudio 2.11.0+cu130` (installed from the `cu130` wheel index;
+  `pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130`).
+  No venv — `python ns.py ...` / `pytest` run straight on the system Python.
+  The old `.venv` was deleted (2026-09-24). `--device auto` lands on CUDA, and fp16
+  AMP (autocast + `torch.amp.GradScaler("cuda", ...)`) turns on automatically for
   CUDA training. CPU throughput was ~5.5s/step; the 3050 does an epoch (20
   steps + eval + 1.26GB checkpoint save) in ~11s.
 - The MMS fine-tune line lives at `checkpoints/mms/` (`facebook/mms-300m`,

@@ -51,11 +51,109 @@ class CheckpointManager:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.latest_path = self.root / "latest.json"
+        self.best_path = self.root / "best.json"
 
         for p in self.root.iterdir():
             m = _VERSION_RE.match(p.name)
             if m:
                 pass  # keep existing versions
+
+    def _read_best(self) -> Optional[Dict[str, Any]]:
+        try:
+            return json.loads(self.best_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return None
+
+    def _write_best(self, entry: Dict[str, Any]) -> None:
+        self.best_path.write_text(json.dumps(entry, indent=2), encoding="utf-8")
+
+    def update_best(
+        self,
+        state: TrainingState,
+        dataset: str,
+        dataset_fingerprint: str,
+    ) -> None:
+        """Record the version just saved as line-best when it qualifies.
+
+        Two minima are tracked per dataset regime (stored in ``best.json``):
+
+          * ``val_loss`` — the canonical metric (computed every validation pass
+            and fed to the LR scheduler). ``prune``'s on-disk ``keep_best``
+            recomputation is a belt-and-suspenders copy of this.
+          * ``cer`` — a separate CER-specific best, kept because CER and
+            validation_loss don't always peak at the same epoch (e.g. the
+            previous combined run: val_loss best ~epoch 20, CER best ~epoch 28).
+
+        A new version updates an entry on the SAME dataset (fingerprint match)
+        only when it beats the stored value. When the dataset changed (fingerprint
+        mismatch) both entries are replaced immediately: an older dataset's lower
+        val_loss must never shadow a newer, harder dataset's best and let the
+        interval pruner delete it — that cross-dataset comparison is what deleted
+        the first combined word+sentence run's best model.
+
+        Both tracked versions are protected by ``prune`` regardless of their
+        epoch or retain interval, and persist across runs until a checkpoint on
+        the same dataset beats them.
+        """
+        loss = float(state.validation_loss)
+        if not loss > 0.0:
+            return
+        vdir = self.version_dir(state.version)
+        if not vdir.exists():
+            return
+        ver = f"v{state.version:03d}"
+        cer = float(state.cer)
+        wer = float(state.wer)
+
+        def entry() -> Dict[str, Any]:
+            return {
+                "version": ver,
+                "path": str(vdir),
+                "epoch": state.epoch,
+                "validation_loss": loss,
+                "cer": cer,
+                "wer": wer,
+            }
+
+        stored = self._read_best()
+        if stored is None or stored.get("dataset_fingerprint") != dataset_fingerprint:
+            self._write_best(
+                {
+                    "val_loss": entry(),
+                    "cer": entry(),
+                    "dataset": dataset,
+                    "dataset_fingerprint": dataset_fingerprint,
+                    "best": True,
+                }
+            )
+            logger.info(
+                "New best checkpoint (new dataset regime): %s val_loss=%.4f cer=%.4f",
+                ver,
+                loss,
+                cer,
+            )
+            return
+
+        v_entry = stored.get("val_loss")
+        c_entry = stored.get("cer")
+        cur_val_loss = float(v_entry["validation_loss"]) if v_entry else float("inf")
+        cur_cer = float(c_entry["cer"]) if c_entry else float("inf")
+
+        if loss >= cur_val_loss and cer >= cur_cer:
+            return  # stored entries still stand on both metrics
+
+        if loss < cur_val_loss:
+            stored["val_loss"] = entry()
+        if cer < cur_cer:
+            stored["cer"] = entry()
+        self._write_best(stored)
+        logger.info(
+            "New best checkpoint (same dataset): val_loss %s=%.4f | cer %s=%.4f",
+            stored["val_loss"]["version"],
+            stored["val_loss"]["validation_loss"],
+            stored["cer"]["version"],
+            stored["cer"]["cer"],
+        )
 
     def _next_version(self) -> int:
         existing = [m.group(1) for p in self.root.iterdir() if (m := _VERSION_RE.match(p.name))]
@@ -154,6 +252,11 @@ class CheckpointManager:
             final + best)
           * anything in ``protect`` (exact names like ``"v026"`` or paths) —
             never deleted
+          * the recorded line-best (``best.json``, written by ``update_best`` at
+            save time) — protected unconditionally, independent of its epoch,
+            the retain interval, and older-dataset overshadowing. ``latest``
+            (most recent epoch) and ``best`` (best validation performance) are
+            separate pointers and are both kept.
 
         The final version is always retained, so ``--resume .../latest`` keeps
         working; resuming from an explicitly-pruned intermediate version does not.
@@ -188,6 +291,23 @@ class CheckpointManager:
                 keep.add(min(measured, key=lambda info: info["validation_loss"])["version"])
         if retain_every and retain_every > 0:
             keep.update(v for v in vers if v % retain_every == 0)
+        best_entry = self._read_best()
+        if best_entry:
+            best_vers = []
+            for block in ("val_loss", "cer"):
+                v = best_entry.get(block, {})
+                if isinstance(v, dict) and v.get("version"):
+                    best_vers.append(str(v["version"]))
+            if best_entry.get("version"):  # legacy single-entry format
+                best_vers.append(str(best_entry["version"]))
+            for bversion in best_vers:
+                bm = _VERSION_RE.match(bversion)
+                if bm and int(bm.group(1)) in vers:
+                    keep.add(int(bm.group(1)))
+                    logger.info(
+                        "Retention: protecting recorded best %s (best.json)",
+                        bversion,
+                    )
         keep.update(protect_nums)
 
         to_delete = [self.version_dir(v) for v in vers if v not in keep]
@@ -217,13 +337,26 @@ class CheckpointManager:
         logger.info("Updated latest checkpoint state: %s", version_dir)
 
     def resolve(self, checkpoint: str) -> Path:
-        """Resolve a checkpoint alias ('v001', 'latest', 'checkpoints/latest', or a path) to a directory."""
+        """Resolve a checkpoint alias ('v001', 'latest', 'checkpoints/latest',
+        'best', 'checkpoints/mms/best', a path, or a line root) to a directory."""
         ckpt = str(checkpoint)
         if ckpt == "latest" or ckpt.endswith("latest") or ckpt.endswith(os.sep + "latest"):
             if not self.latest_path.exists():
                 raise FileNotFoundError(f"No latest checkpoint: {self.latest_path}")
             data = json.loads(self.latest_path.read_text(encoding="utf-8"))
             return Path(data["path"])
+        if ckpt == "best" or Path(ckpt).name == "best":
+            if not self.best_path.exists():
+                raise FileNotFoundError(f"No best checkpoint recorded: {self.best_path}")
+            data = json.loads(self.best_path.read_text(encoding="utf-8"))
+            block = data.get("val_loss") or data  # new dual entry or legacy single
+            path = Path(block["path"])
+            if not (path / "model.pt").exists():
+                raise FileNotFoundError(
+                    f"Recorded best checkpoint {path} is missing; it may have been "
+                    "deleted before best.json tracking was introduced."
+                )
+            return path
 
         path = Path(checkpoint)
         if not path.is_absolute():
@@ -231,6 +364,12 @@ class CheckpointManager:
             path = candidate
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+        if (path / "latest.json").exists():
+            return self.resolve(str(path / "latest"))
+        if not (path / "model.pt").exists():
+            raise FileNotFoundError(
+                f"No checkpoint inside {path} (expected a version dir or a line with latest.json)"
+            )
         return path
 
     def load(self, checkpoint: str) -> Dict[str, Any]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import random
@@ -167,7 +168,35 @@ def split_dataset(
     return train, valid, test
 
 
-def save_split(path: Path, train: List[ManifestRow], valid: List[ManifestRow], test: List[ManifestRow], seed: int):
+def manifest_fingerprint(manifest_path: Path) -> str:
+    """Content hash of a manifest file, used to detect stale persisted splits."""
+    with open(manifest_path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def split_fingerprint(path: Path) -> Optional[str]:
+    """Return the manifest fingerprint a saved split was built from, if any."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    return data.get("manifest_fingerprint")
+
+
+def split_row_counts(path: Path) -> List[int]:
+    """Per-group row counts of a saved split file ([] if unreadable).
+
+    Used as a legacy staleness heuristic for splits saved before the
+    manifest fingerprint field was introduced.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return []
+    return [len(data.get(k, [])) for k in ("train", "valid", "test")]
+
+
+def save_split(path: Path, train: List[ManifestRow], valid: List[ManifestRow], test: List[ManifestRow], seed: int, fingerprint: Optional[str] = None):
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "seed": seed,
@@ -175,6 +204,8 @@ def save_split(path: Path, train: List[ManifestRow], valid: List[ManifestRow], t
         "valid": [r.__dict__ for r in valid],
         "test": [r.__dict__ for r in test],
     }
+    if fingerprint is not None:
+        data["manifest_fingerprint"] = fingerprint
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     logger.info("Split saved to %s", path)
 

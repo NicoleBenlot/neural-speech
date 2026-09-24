@@ -10,6 +10,9 @@ from src.data.dataset import (
     split_dataset,
     save_split,
     load_split,
+    manifest_fingerprint,
+    split_fingerprint,
+    split_row_counts,
 )
 from src.tokens.tokenizer import CharTokenizer
 
@@ -81,3 +84,30 @@ def test_save_load_split(tmp_path, tiny_manifest):
     assert len(valid_ds) == len(valid)
     assert len(test_ds) == len(test)
     assert train_ds[0]["id"].item() == train[0].id
+
+
+def test_manifest_fingerprint_tracks_content(tmp_path, tiny_manifest):
+    fp1 = manifest_fingerprint(tiny_manifest)
+    tiny_manifest.write_text(
+        tiny_manifest.read_text(encoding="utf-8") + "105,noop.wav,extra,ad\n",
+        encoding="utf-8",
+    )
+    assert manifest_fingerprint(tiny_manifest) != fp1
+
+
+def test_save_split_stores_fingerprint(tmp_path, tiny_manifest):
+    rows = read_manifest(tiny_manifest)
+    train, valid, test = split_dataset(rows, seed=3)
+    path = tmp_path / "split.json"
+    save_split(path, train, valid, test, seed=3, fingerprint=manifest_fingerprint(tiny_manifest))
+    assert split_fingerprint(path) == manifest_fingerprint(tiny_manifest)
+    assert sum(split_row_counts(path)) == len(rows)
+
+
+def test_legacy_split_has_no_fingerprint(tmp_path, tiny_manifest):
+    rows = read_manifest(tiny_manifest)
+    train, valid, test = split_dataset(rows, seed=3)
+    path = tmp_path / "split.json"
+    save_split(path, train, valid, test, seed=3)
+    assert split_fingerprint(path) is None
+    assert sum(split_row_counts(path)) == len(rows)
