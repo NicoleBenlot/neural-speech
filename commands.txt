@@ -1,5 +1,24 @@
 Important commands (run from repo root, always with the venv python: .venv\Scripts\python.exe or `python` if venv is active):
 
+NOTES TO KNOW BEFOREHAND:
+- Always use the VENV python (.venv\Scripts\python.exe), never the base D:\python one.
+  venv has the GPU torch (cu130); base D:\python has the old CPU build.
+- -d auto picks CUDA -> MPS -> CPU for you; fp16 AMP turns itself ON for CUDA.
+- Checkpoints auto-prune after every saved epoch: keep = final + best-val-loss + every Nth
+  (--retain-every 10 default). Pass --retain-every 0 to disable, --retain-protect vNNN to pin.
+  resume only works from a KEPT version. Never save into an existing version dir.
+- Checkpoints/mms now holds ONLY v026 (best) + v030 (final) = 3.1 GB. Weights are never in git.
+- index.txt now supports SENTENCES: "ang bata nagdula sa bola = 196" (multi-word OK, id = filename).
+- No audio-length cap; only --max-text-len (default 64) limits decode. Long sentences: raise to 128.
+- 6 GB GPU: batch too big = CUDA out of memory (OOM). Drop -b 8 -> -b 4.
+- Audio loads via soundfile fallback automatically - real .opus works even without FFmpeg full-shared.
+- .venv is NOT portable between PCs - recreate with pip install -r requirements.txt.
+  (.venv and checkpoints/ are git-ignored; GitHub never stores them.)
+- bash = Git for Windows. New terminals pick it up (C:\Program Files\Git\bin added to user PATH).
+- Flash drive D: = "KINGSTONE E". copy_repo.sh pushes/pulls the repo (skips .venv + caches).
+  Off-site alternative if you ever need version history: DVC/cloud with the same keep-set policy.
+- NEVER combine --resume and --from-checkpoint.
+
 Data prep:
 python ns.py prepare                          # index.txt -> data/processed/manifest.csv
 python ns.py validate --fail-on-error         # dataset checks
