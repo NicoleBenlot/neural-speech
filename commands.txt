@@ -5,8 +5,10 @@ NOTES TO KNOW BEFOREHAND:
   venv has the GPU torch (cu130); base D:\python has the old CPU build.
 - -d auto picks CUDA -> MPS -> CPU for you; fp16 AMP turns itself ON for CUDA.
 - Checkpoints auto-prune after every saved epoch: keep = recorded best (best.json)
-  + final + best-val-loss + every Nth (--retain-every 10 default). Pass --retain-every 0
-  to disable, --retain-protect vNNN to pin. resume only works from a KEPT version.
+  + final + best-val-loss. Positive --retain-every N also keeps every Nth version;
+  default 0 is best-only plus final. Use a negative value to disable pruning, and
+  --retain-protect vNNN to pin (or add vNNN to checkpoints/<line>/protect.json
+  for a persistent per-line pin). resume only works from a KEPT version.
   Never save into an existing version dir.
 - latest != best: latest.json = most recent epoch, best.json = best validation
   performance. best.json tracks both val_loss-min and CER-min independently
@@ -47,7 +49,8 @@ Handled for you automatically (no typing needed):
 
 Always-available train flags (long form still works):
 --dataset <csv> -b/--batch-size -e/--epochs -d/--device -mtl/--max-text-len
---retain-every N (prune interval; 0 = keep all)   --retain-protect vNNN (pin a version)
+--retain-every N (positive milestone interval; 0 = best-only; negative = keep all)
+--retain-protect vNNN (pin a version)
 --replay-manifest <csv> --replay-ratio 0.3        --eval-manifest <old-csv> (regression)
 
 Short-flag map: -m model backbone (fb/mms/mms-300m = facebook/mms-300m; none = from scratch)

@@ -8,6 +8,7 @@ import torch
 from src.training.train import (
     _BACKBONE_ALIASES,
     _apply_mode_defaults,
+    _build_plateau,
     build_arg_parser,
     TrainConfig,
     Trainer,
@@ -44,7 +45,7 @@ def base_config(tmp_path: Path, tiny_manifest: Path):
         "eval_manifest": None,
         # These tests exercise version immutability/resume, not retention;
         # opt out of auto-pruning so every version stays on disk.
-        "retain_every": 0,
+        "retain_every": -1,
         "model": _tiny_model_config(),
     }
 
@@ -220,3 +221,55 @@ def test_changed_manifest_resplits_on_continue(base_config, tmp_path):
     # and the split file must be rewritten against the new manifest.
     assert len(train_ds) == 5
     assert split_fingerprint(split_file) == manifest_fingerprint(new_manifest)
+
+
+def test_lr_patience_flag_changes_plateau_trigger():
+    """ReduceLROnPlateau with patience=3 must fire on a sequence where the
+    default patience=5 does not -- proves the configurable flag actually
+    changes behavior rather than being accepted and ignored."""
+    seq = [1.0, 0.8, 0.9, 0.95, 1.05, 1.1]  # best=0.8, then 4 consecutive bad
+
+    def drops(patience):
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1e-3)
+        sch = _build_plateau(opt, lr_patience=patience, lr_factor=0.1)
+        events = []
+        for v in seq:
+            lr_before = opt.param_groups[0]["lr"]
+            sch.step(v)
+            lr_after = opt.param_groups[0]["lr"]
+            if lr_after != lr_before:
+                events.append((v, lr_after))
+        return events
+
+    p3 = drops(3)
+    p5 = drops(5)
+    assert p3                  # 4 consecutive bad epochs > patience 3 -> fires
+    assert not p5              # 4 bad epochs <= patience 5 -> default never fires
+    assert len(p3) == 1
+    assert abs(p3[0][1] - 1e-4) < 1e-12  # factor 0.1: 1e-3 -> 1e-4
+
+
+def test_lr_flags_wire_into_config_and_defaults():
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--lr-patience", "3",
+            "--lr-factor", "0.2",
+            "--lr-threshold", "0.01",
+            "--lr-cooldown", "2",
+        ]
+    )
+    assert args.lr_patience == 3
+    assert args.lr_factor == 0.2
+    assert args.lr_threshold == 0.01
+    assert args.lr_cooldown == 2
+
+    # defaults match the historical hardcoded scheduler exactly
+    defaults = parser.parse_args([])
+    assert defaults.lr_patience == 5
+    assert defaults.lr_factor == 0.1
+    assert defaults.lr_threshold == 1e-4
+    assert defaults.lr_cooldown == 0
+    assert TrainConfig().lr_patience == 5
+    assert defaults.retain_every == 0
+    assert TrainConfig().retain_every == 0

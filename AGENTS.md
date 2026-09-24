@@ -61,9 +61,10 @@ Checkpoints are the only large artifact (a 30-epoch MMS run ≈ 46.5 GB). Policy
 enforced by the trainer's auto-prune (default ON):
 
 - Keep **only**: the recorded best (`best.json`, maintained by `update_best`), the
-  best version by on-disk `validation_loss` (flag 'best'), the **final** version
-  (newest, `latest.json` stays valid), and **every Nth version** for trend
-  visibility — `--retain-every N` (default **10**; 0 = disable pruning, keep all).
+  best version by on-disk `validation_loss` (flag 'best'), and the **final** version
+  (newest, `latest.json` stays valid). Positive `--retain-every N` additionally
+  keeps every Nth version for trend visibility; default `0` is best-only plus final,
+  while a negative value disables pruning.
 - **`latest` ≠ `best`**: `latest.json` points at the most recent epoch; `best.json`
   at the best validation performance. Both survive pruning independently.
   `CheckpointManager.resolve`/`load` accept `best` / `checkpoints/mms/best`
@@ -79,7 +80,10 @@ enforced by the trainer's auto-prune (default ON):
   combined word+sentence run (its best ~epoch 26-28 was deleted; only
   milestones + the old parent survived).
 - `--retain-protect v026` (repeatable) adds any version that must never be deleted,
-  regardless of the keep-set (e.g. published reference points).
+  regardless of the keep-set (e.g. published reference points). Per-line durable
+  protection lives in `<line>/protect.json` (list of version names, e.g. `["v030"]`),
+  auto-merged into *every* `prune()` call — no CLI flag needed on future runs, so a
+  historical reference survives even retroactive pruning.
 - Pruning runs automatically after every validated checkpoint save and again at the
   end of the run; deleted versions are logged at WARNING level. `CheckpointManager.prune`
   also has a `dry_run=True` for rehearsing.
@@ -87,7 +91,7 @@ enforced by the trainer's auto-prune (default ON):
   or an explicit milestone/best/protected version. Resuming from a pruned intermediate
   version is not possible by design.
 - Retroactive pruning: run a dry-run snippet against a line (e.g.
-  `CheckpointManager('checkpoints/mms').prune(retain_every=10, keep_best=True, dry_run=True)`)
+  `CheckpointManager('checkpoints/mms').prune(retain_every=0, keep_best=True, dry_run=True)`)
   then apply with `dry_run=False`. 46.5 GB (mms line) → ~6.2 GB with the default
   keep-set (v010, v020, v026 best, v030 final). Applied as of 2026-09-24:
   retroactive choose-best-only pruning left `checkpoints/mms` at **v026 (best) +

@@ -75,8 +75,12 @@ class TrainConfig:
     max_audio_len: int = 5
     max_text_len: int = 64
     beam_size: int = 5
-    retain_every: int = 10
+    retain_every: int = 0
     retain_protect: List[str] = field(default_factory=list)
+    lr_patience: int = 5
+    lr_factor: float = 0.1
+    lr_threshold: float = 1e-4
+    lr_cooldown: int = 0
     new_run: bool = False
     continue_mode: Optional[str] = None
     model: STTConfig = field(default_factory=STTConfig)
@@ -86,6 +90,28 @@ class TrainConfig:
 
 def _is_true_env_flag(name: str) -> bool:
     return os.environ.get(name, "1").lower() not in {"0", "false", "no", "off"}
+
+
+def _build_plateau(
+    optimizer: torch.optim.Optimizer,
+    lr_patience: int = 5,
+    lr_factor: float = 0.1,
+    lr_threshold: float = 1e-4,
+    lr_cooldown: int = 0,
+) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
+    """ReduceLROnPlateau with the project's configurable hyperparameters.
+
+    ``mode="min"`` (lower validation_loss is better) with relative threshold,
+    matching the historical hardcoded scheduler until a flag overrides it.
+    """
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        patience=lr_patience,
+        factor=lr_factor,
+        threshold=lr_threshold,
+        cooldown=lr_cooldown,
+    )
 
 
 class Trainer:
@@ -238,9 +264,23 @@ class Trainer:
                 raise ValueError(f"Unsupported optimizer: {self.config.optimizer}")
 
         if self.scheduler is None:
-            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode="min", patience=5
-            )
+            self.scheduler = self._build_scheduler()
+
+    def _build_scheduler(self) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
+        """Build the LR scheduler from configurable plateau hyperparameters.
+
+        Used by both the fresh-path and the resume path so a --lr-patience /
+        --lr-factor / --lr-threshold / --lr-cooldown choice is honored
+        identically everywhere. ``--resume`` then overlays the saved
+        scheduler state (best / num_bad_epochs / last_lr) on top.
+        """
+        return _build_plateau(
+            self.optimizer,
+            lr_patience=self.config.lr_patience,
+            lr_factor=self.config.lr_factor,
+            lr_threshold=self.config.lr_threshold,
+            lr_cooldown=self.config.lr_cooldown,
+        )
 
     def _restore_checkpoint(self, path: str):
         data = self.manager.load(path)
@@ -264,9 +304,7 @@ class Trainer:
         if data["optimizer_sd"] is not None:
             self.optimizer.load_state_dict(data["optimizer_sd"])
 
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode="min", patience=5
-        )
+        self.scheduler = self._build_scheduler()
         if data["scheduler_sd"] is not None:
             self.scheduler.load_state_dict(data["scheduler_sd"])
 
@@ -316,6 +354,7 @@ class Trainer:
             collate_fn=collate_speech,
             num_workers=0,
         )
+        typed_valid_loaders = self._build_typed_validation_loaders(valid_ds)
         test_loader = DataLoader(
             test_ds,
             batch_size=self.config.batch_size,
@@ -363,7 +402,10 @@ class Trainer:
             val_wer = 0.0
             if should_val:
                 val_loss, val_cer, val_wer = self._evaluate(valid_loader)
+                validation_by_type = self._evaluate_by_type(typed_valid_loaders)
                 self.scheduler.step(val_loss)
+            else:
+                validation_by_type = {}
 
             lr = self.optimizer.param_groups[0]["lr"]
 
@@ -375,11 +417,17 @@ class Trainer:
                 f"CER={val_cer:.4f} WER={val_wer:.4f} "
                 f"lr={lr:.2e}"
             )
+            for sample_type, metrics in validation_by_type.items():
+                print(
+                    f"  {sample_type}: val_loss={metrics['loss']:.4f} "
+                    f"CER={metrics['cer']:.4f} WER={metrics['wer']:.4f}"
+                )
 
             self.state.train_loss = train_loss
             self.state.validation_loss = val_loss
             self.state.cer = val_cer
             self.state.wer = val_wer
+            self.state.validation_by_type = validation_by_type
 
             if should_val:
                 self._save_checkpoint(
@@ -644,6 +692,46 @@ class Trainer:
         avg_loss = total_loss / max(n_batches, 1)
         return avg_loss, metrics.cer, metrics.wer
 
+    def _build_typed_validation_loaders(
+        self, valid_ds: SpeechDataset
+    ) -> Dict[str, DataLoader]:
+        """Build automatic word/sentence validation views from transcript text."""
+        typed: Dict[str, DataLoader] = {}
+        for sample_type in ("word", "sentence"):
+            rows = [
+                row for row in valid_ds.rows
+                if (len(row.text.split()) == 1) == (sample_type == "word")
+            ]
+            if not rows:
+                continue
+            dataset = _rows_to_dataset(
+                [row.__dict__ for row in rows],
+                self.tokenizer,
+                self.config.sample_rate,
+            )
+            typed[sample_type] = DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                shuffle=False,
+                collate_fn=collate_speech,
+                num_workers=0,
+            )
+            logger.info("%s validation samples: %d", sample_type, len(dataset))
+        return typed
+
+    def _evaluate_by_type(
+        self, loaders: Dict[str, DataLoader]
+    ) -> Dict[str, Dict[str, float]]:
+        results: Dict[str, Dict[str, float]] = {}
+        for sample_type, loader in loaders.items():
+            loss, sample_cer, sample_wer = self._evaluate(loader)
+            results[sample_type] = {
+                "loss": loss,
+                "cer": sample_cer,
+                "wer": sample_wer,
+            }
+        return results
+
     def _save_checkpoint(self, manifest: Dict):
         self.state.global_step = self.global_step
         version_dir = self.manager.save(
@@ -667,7 +755,7 @@ class Trainer:
         )
 
     def _prune_checkpoints(self):
-        if self.config.retain_every == 0 and not self.config.retain_protect:
+        if self.config.retain_every < 0:
             return
         self.manager.prune(
             retain_every=self.config.retain_every,
@@ -794,10 +882,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retain-every",
         type=int,
-        default=10,
-        help="Checkpoint retention: keep every Nth version plus the best-val-loss "
-        "and final versions, deleting the rest after each validated save. "
-        "0 = keep every version (old behaviour). Default 10.",
+        default=0,
+        help="Checkpoint retention: keep the final, metric-best, and protected "
+        "versions. Positive N also keeps every Nth version; 0 disables milestone "
+        "retention; negative values disable pruning. Default 0.",
     )
     parser.add_argument(
         "--retain-protect",
@@ -806,6 +894,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="VERSION",
         help="Never delete this version dir (e.g. --retain-protect v026). "
         "Repeatable. Independent of the milestone/best/final keep-set.",
+    )
+    parser.add_argument(
+        "--lr-patience",
+        type=int,
+        default=5,
+        help="ReduceLROnPlateau patience (epochs without improvement before the "
+        "LR drops). Default 5 (matches the old hardcoded value).",
+    )
+    parser.add_argument(
+        "--lr-factor",
+        type=float,
+        default=0.1,
+        help="ReduceLROnPlateau reduction factor (new_lr = lr * factor). Default 0.1.",
+    )
+    parser.add_argument(
+        "--lr-threshold",
+        type=float,
+        default=1e-4,
+        help="ReduceLROnPlateau threshold for 'no significant improvement' "
+        "(relative to the current best; threshold_mode='rel'). Default 1e-4.",
+    )
+    parser.add_argument(
+        "--lr-cooldown",
+        type=int,
+        default=0,
+        help="ReduceLROnPlateau cooldown: epochs to wait after a drop before "
+        "the patience counter resumes. Default 0.",
     )
     return parser
 
@@ -950,6 +1065,10 @@ def main():
         beam_size=args.beam_size,
         retain_every=args.retain_every,
         retain_protect=args.retain_protect,
+        lr_patience=args.lr_patience,
+        lr_factor=args.lr_factor,
+        lr_threshold=args.lr_threshold,
+        lr_cooldown=args.lr_cooldown,
         new_run=args.new,
         continue_mode=getattr(args, "continue"),
         model=model_config,

@@ -33,6 +33,7 @@ class TrainingState:
     validation_loss: float = 0.0
     wer: float = 0.0
     cer: float = 0.0
+    validation_by_type: Dict[str, Dict[str, float]] = field(default_factory=dict)
     regression: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -52,11 +53,27 @@ class CheckpointManager:
         self.root.mkdir(parents=True, exist_ok=True)
         self.latest_path = self.root / "latest.json"
         self.best_path = self.root / "best.json"
+        self.protect_path = self.root / "protect.json"
 
         for p in self.root.iterdir():
             m = _VERSION_RE.match(p.name)
             if m:
                 pass  # keep existing versions
+
+    def _read_protect(self) -> List[str]:
+        """Persistent per-line protection list (``protect.json``), e.g. ["v030"].
+
+        Entries are merged into every ``prune`` call regardless of interval
+        rules or CLI flags, so a historical/reference version can be pinned
+        against auto-pruning forever.
+        """
+        try:
+            data = json.loads(self.protect_path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [str(x).strip() for x in data if str(x).strip()]
+        except (ValueError, OSError):
+            pass
+        return []
 
     def _read_best(self) -> Optional[Dict[str, Any]]:
         try:
@@ -75,7 +92,7 @@ class CheckpointManager:
     ) -> None:
         """Record the version just saved as line-best when it qualifies.
 
-        Two minima are tracked per dataset regime (stored in ``best.json``):
+                Minima are tracked per dataset regime (stored in ``best.json``):
 
           * ``val_loss`` — the canonical metric (computed every validation pass
             and fed to the LR scheduler). ``prune``'s on-disk ``keep_best``
@@ -83,6 +100,9 @@ class CheckpointManager:
           * ``cer`` — a separate CER-specific best, kept because CER and
             validation_loss don't always peak at the same epoch (e.g. the
             previous combined run: val_loss best ~epoch 20, CER best ~epoch 28).
+                    * ``word_cer`` / ``sentence_cer`` and their validation losses —
+                        optional subset-specific minima populated when the trainer has
+                        word/sentence validation rows.
 
         A new version updates an entry on the SAME dataset (fingerprint match)
         only when it beats the stored value. When the dataset changed (fingerprint
@@ -102,58 +122,78 @@ class CheckpointManager:
         if not vdir.exists():
             return
         ver = f"v{state.version:03d}"
-        cer = float(state.cer)
-        wer = float(state.wer)
 
-        def entry() -> Dict[str, Any]:
+        def entry(
+            validation_loss: float, cer: float, wer: float, sample_type: Optional[str] = None
+        ) -> Dict[str, Any]:
             return {
                 "version": ver,
                 "path": str(vdir),
                 "epoch": state.epoch,
-                "validation_loss": loss,
+                "validation_loss": validation_loss,
                 "cer": cer,
                 "wer": wer,
+                **({"sample_type": sample_type} if sample_type else {}),
             }
+
+        candidates: Dict[str, tuple[float, str, Dict[str, Any]]] = {
+            "val_loss": (loss, "validation_loss", entry(loss, float(state.cer), float(state.wer))),
+            "cer": (float(state.cer), "cer", entry(loss, float(state.cer), float(state.wer))),
+        }
+        for sample_type, metrics in state.validation_by_type.items():
+            if not metrics:
+                continue
+            sample_loss = float(metrics.get("loss", 0.0))
+            sample_cer = float(metrics.get("cer", 0.0))
+            sample_wer = float(metrics.get("wer", 0.0))
+            if sample_loss > 0.0:
+                candidates[f"{sample_type}_val_loss"] = (
+                    sample_loss,
+                    "validation_loss",
+                    entry(sample_loss, sample_cer, sample_wer, sample_type),
+                )
+            if sample_cer >= 0.0:
+                candidates[f"{sample_type}_cer"] = (
+                    sample_cer,
+                    "cer",
+                    entry(sample_loss, sample_cer, sample_wer, sample_type),
+                )
 
         stored = self._read_best()
         if stored is None or stored.get("dataset_fingerprint") != dataset_fingerprint:
-            self._write_best(
+            fresh = {name: candidate[2] for name, candidate in candidates.items()}
+            fresh.update(
                 {
-                    "val_loss": entry(),
-                    "cer": entry(),
                     "dataset": dataset,
                     "dataset_fingerprint": dataset_fingerprint,
                     "best": True,
                 }
             )
+            self._write_best(fresh)
             logger.info(
                 "New best checkpoint (new dataset regime): %s val_loss=%.4f cer=%.4f",
                 ver,
                 loss,
-                cer,
+                state.cer,
             )
             return
 
-        v_entry = stored.get("val_loss")
-        c_entry = stored.get("cer")
-        cur_val_loss = float(v_entry["validation_loss"]) if v_entry else float("inf")
-        cur_cer = float(c_entry["cer"]) if c_entry else float("inf")
-
-        if loss >= cur_val_loss and cer >= cur_cer:
-            return  # stored entries still stand on both metrics
-
-        if loss < cur_val_loss:
-            stored["val_loss"] = entry()
-        if cer < cur_cer:
-            stored["cer"] = entry()
-        self._write_best(stored)
-        logger.info(
-            "New best checkpoint (same dataset): val_loss %s=%.4f | cer %s=%.4f",
-            stored["val_loss"]["version"],
-            stored["val_loss"]["validation_loss"],
-            stored["cer"]["version"],
-            stored["cer"]["cer"],
-        )
+        changed = False
+        for name, (value, field_name, candidate) in candidates.items():
+            current = stored.get(name)
+            current_value = float(current[field_name]) if current else float("inf")
+            if value < current_value:
+                stored[name] = candidate
+                changed = True
+        if changed:
+            self._write_best(stored)
+            logger.info(
+                "New best checkpoint (same dataset): val_loss %s=%.4f | cer %s=%.4f",
+                stored["val_loss"]["version"],
+                stored["val_loss"]["validation_loss"],
+                stored["cer"]["version"],
+                stored["cer"]["cer"],
+            )
 
     def _next_version(self) -> int:
         existing = [m.group(1) for p in self.root.iterdir() if (m := _VERSION_RE.match(p.name))]
@@ -237,7 +277,7 @@ class CheckpointManager:
 
     def prune(
         self,
-        retain_every: int = 10,
+        retain_every: int = 0,
         keep_best: bool = True,
         protect: Optional[List[str]] = None,
         dry_run: bool = False,
@@ -247,11 +287,14 @@ class CheckpointManager:
         Retention policy (applied going forward and safe to reuse retroactively):
           * the final (newest) version — always kept (``latest.json`` stays valid)
           * the best version by ``validation_loss`` (if any real measurement exists)
-          * every version whose ordinal is a multiple of ``retain_every``
-            (diagnostic trend visibility; ``retain_every=0`` keeps only the
-            final + best)
+                    * every version whose ordinal is a multiple of ``retain_every``
+                        (diagnostic trend visibility when positive; ``retain_every=0``
+                        keeps only the final + best)
           * anything in ``protect`` (exact names like ``"v026"`` or paths) —
-            never deleted
+            never deleted; the line's persistent ``protect.json`` list is
+            merged in automatically on every call, so a historical reference
+            version can be pinned against auto-pruning forever (no CLI flag
+            needed on future runs)
           * the recorded line-best (``best.json``, written by ``update_best`` at
             save time) — protected unconditionally, independent of its epoch,
             the retain interval, and older-dataset overshadowing. ``latest``
@@ -269,7 +312,7 @@ class CheckpointManager:
             return []
 
         protect_nums = set()
-        for entry in protect or []:
+        for entry in ([*(protect or []), *self._read_protect()]):
             entry = str(entry).strip()
             m = _VERSION_RE.match(entry)
             if m:
@@ -289,13 +332,12 @@ class CheckpointManager:
             ]
             if measured:
                 keep.add(min(measured, key=lambda info: info["validation_loss"])["version"])
-        if retain_every and retain_every > 0:
+        if retain_every > 0:
             keep.update(v for v in vers if v % retain_every == 0)
         best_entry = self._read_best()
         if best_entry:
             best_vers = []
-            for block in ("val_loss", "cer"):
-                v = best_entry.get(block, {})
+            for v in best_entry.values():
                 if isinstance(v, dict) and v.get("version"):
                     best_vers.append(str(v["version"]))
             if best_entry.get("version"):  # legacy single-entry format

@@ -125,6 +125,41 @@ def test_default_inference_checkpoint_uses_mms_line():
     assert name == "latest"
 
 
+def test_persistent_protect_json(tmp_path):
+    """protect.json in the line root protects a version against every prune
+    even when no CLI --retain-protect flag is passed (historical references)."""
+    manager = CheckpointManager(str(tmp_path))
+    # v002 is best on both metrics (best.json), v003 newest, v001 deletable
+    # unless protect.json pins it.
+    seq = [(3.0, 0.9), (1.5, 0.5), (1.8, 0.6)]
+    for v, (loss, cer) in enumerate(seq, start=1):
+        _save_version(manager, loss, cer, 1.0)
+        manager.update_best(
+            TrainingState(version=v, validation_loss=loss, cer=cer, wer=1.0),
+            "data/processed/manifest.csv",
+            "fp",
+        )
+    (tmp_path / "protect.json").write_text(json.dumps(["v001"]), encoding="utf-8")
+
+    manager.prune(retain_every=0, keep_best=False)   # only final + best + protect survive
+    assert (tmp_path / "v001").exists()   # historical reference kept (protect.json)
+    assert (tmp_path / "v002").exists()   # recorded best
+    assert (tmp_path / "v003").exists()   # newest
+    assert (tmp_path / "best.json").exists()
+
+    # survives with the caller's CLI protect list too (union, not override)
+    manager.prune(retain_every=0, keep_best=False, protect=["v003"])
+    assert (tmp_path / "v001").exists()
+    assert (tmp_path / "v003").exists()
+    assert json.loads((tmp_path / "protect.json").read_text(encoding="utf-8")) == ["v001"]
+
+    # without protect.json the historical version would be deleted
+    (tmp_path / "protect.json").unlink()
+    manager.prune(retain_every=0, keep_best=False)
+    assert not (tmp_path / "v001").exists()
+    assert (tmp_path / "v002").exists() and (tmp_path / "v003").exists()
+
+
 def test_training_state_roundtrip():
     state = TrainingState(
         version=1,
@@ -228,6 +263,39 @@ def test_best_tracks_cer_and_validation_loss_independently(tmp_path):
     assert (tmp_path / "v002").exists()   # val_loss best (not newest)
     assert (tmp_path / "v003").exists()   # CER best + newest
     assert not (tmp_path / "v001").exists()
+
+
+def test_best_tracks_word_and_sentence_metrics_for_retention(tmp_path):
+    manager = CheckpointManager(str(tmp_path))
+    metrics = [
+        (2.0, 0.8, 0.5, 0.9, 2.0),
+        (1.8, 0.7, 0.1, 0.8, 1.5),  # word CER and word loss best
+        (1.5, 0.6, 0.3, 0.2, 1.8),  # sentence CER and val-loss best
+        (1.9, 0.5, 0.4, 0.4, 1.9),  # combined CER best and final
+    ]
+    for version, (loss, combined_cer, word_cer, sentence_cer, word_loss) in enumerate(metrics, 1):
+        _save_version(manager, loss, combined_cer, 0.5)
+        manager.update_best(
+            TrainingState(
+                version=version,
+                validation_loss=loss,
+                cer=combined_cer,
+                wer=0.5,
+                validation_by_type={
+                    "word": {"loss": word_loss, "cer": word_cer, "wer": 0.5},
+                    "sentence": {"loss": loss, "cer": sentence_cer, "wer": 0.5},
+                },
+            ),
+            "data/processed/manifest.csv",
+            "fp",
+        )
+
+    best = json.loads((tmp_path / "best.json").read_text(encoding="utf-8"))
+    assert best["word_cer"]["version"] == "v002"
+    assert best["sentence_cer"]["version"] == "v003"
+
+    manager.prune(retain_every=0, keep_best=False)
+    assert manager.versions() == [2, 3, 4]
 
 
 def test_resolve_best(tmp_path):
