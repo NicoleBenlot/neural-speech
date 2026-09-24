@@ -31,6 +31,8 @@ class STTConfig:
     pad_token_id: int = 0
     head: str = "decoder"  # "decoder" (seq2seq) or "ctc" (CTC head)
     blank_token_id: Optional[int] = None  # set to the CTC blank index when head == "ctc"
+    backbone: str = "none"  # "none" (from-scratch encoder) or a HF model id like "facebook/mms-300m"
+    backbone_unfreeze_layers: int = 4  # last K transformer layers left trainable when backbone is used
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -49,18 +51,31 @@ class STTModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = vocab_size
+        self.mms_encoder = None
 
-        from src.models.encoder import AudioFeatureExtractor
+        uses_backbone = config.backbone is not None and config.backbone != "none"
+        if uses_backbone:
+            from src.models.encoder import MMSAudioEncoder
 
-        self.feature_extractor = AudioFeatureExtractor(
-            input_channels=1,
-            channels=config.feat_channels,
-            n_layers=config.feat_layers,
-            kernel_size=config.feat_kernel,
-            stride=config.feat_stride,
-            output_dim=config.d_model,
-        )
-        self.encoder = build_encoder(config.to_dict())
+            self.mms_encoder = MMSAudioEncoder(
+                model_id=config.backbone,
+                unfreeze_layers=config.backbone_unfreeze_layers,
+            )
+            self.feature_extractor = None
+            self.encoder = None
+            self.config.d_model = self.mms_encoder.hidden_dim
+        else:
+            from src.models.encoder import AudioFeatureExtractor
+
+            self.feature_extractor = AudioFeatureExtractor(
+                input_channels=1,
+                channels=config.feat_channels,
+                n_layers=config.feat_layers,
+                kernel_size=config.feat_kernel,
+                stride=config.feat_stride,
+                output_dim=config.d_model,
+            )
+            self.encoder = build_encoder(config.to_dict())
 
         if config.head == "ctc":
             self.ctc_head = build_ctc_head(
@@ -87,6 +102,12 @@ class STTModel(nn.Module):
         Returns:
             (encoder_out (B, T_e, D), encoder_lengths (B,))
         """
+        if self.mms_encoder is not None:
+            encoder_out = self.mms_encoder(audio, audio_lengths)
+            lengths = self.mms_encoder.feat_out_lengths(audio_lengths)
+            lengths = torch.clamp(lengths, max=encoder_out.shape[1])
+            return encoder_out, lengths
+
         features = self.feature_extractor(audio)
 
         # Downsample lengths proportionally to the 2^n stride rule.
@@ -163,9 +184,13 @@ class STTModel(nn.Module):
     def ctc_input_lengths(self, audio_lengths: torch.Tensor) -> torch.Tensor:
         """Encoder output length per sample after the frame downsampling.
 
-        Mirrors encode()'s repeated ``ceil(T / feat_stride)`` length rule so
-        CTCLoss gets input lengths that match the actual per-frame counts.
+        With a pretrained backbone this is the conv feature-extractor
+        downsampling of the MMS encoder; otherwise it mirrors encode()'s
+        repeated ``ceil(T / feat_stride)`` length rule so CTCLoss gets input
+        lengths that match the actual per-frame counts.
         """
+        if self.mms_encoder is not None:
+            return self.mms_encoder.feat_out_lengths(audio_lengths).clamp(min=1)
         lengths = audio_lengths
         for _ in range(self.config.feat_layers):
             lengths = torch.ceil(lengths / self.config.feat_stride).long()

@@ -1,4 +1,4 @@
-"""Parser for the raw index.txt format mapping words to audio IDs."""
+"""Parser for the raw index.txt format mapping transcripts (words or sentences) to audio IDs."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 _SECTION_RE = re.compile(r"^\[(\w+)\]\s*$")
-_ENTRY_RE = re.compile(r"^(\S+)\s*=\s*(\d+)\s*$")
+_ENTRY_RE = re.compile(r"^(.+?)\s*=\s*(\d+)\s*$")
 
 
 @dataclass(frozen=True)
@@ -68,7 +68,7 @@ def parse_index(index_path: Path, assets_dir: Optional[Path] = None) -> ParseRes
 
         entry_match = _ENTRY_RE.match(line)
         if entry_match:
-            word = entry_match.group(1)
+            text = entry_match.group(1)
             audio_id = int(entry_match.group(2))
             audio_path = str(assets_dir / f"{audio_id}.opus")
 
@@ -76,7 +76,7 @@ def parse_index(index_path: Path, assets_dir: Optional[Path] = None) -> ParseRes
                 IndexEntry(
                     id=audio_id,
                     audio_path=audio_path,
-                    text=word,
+                    text=text,
                     section=current_section,
                 )
             )

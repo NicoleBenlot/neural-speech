@@ -20,7 +20,9 @@ from typing import Dict, Tuple
 from src.data import prepare as prepare_mod
 from src.data import validate as validate_mod
 from src.deploy import optimize as optimize_mod
+from src.device_info import main as devices_mod
 from src.inference import mic as mic_mod
+from src.inference import probe as probe_mod
 from src.inference import transcriber as transcribe_mod
 from src.training import train as train_mod
 
@@ -31,6 +33,8 @@ COMMANDS: Dict[str, tuple] = {
     "transcribe": (transcribe_mod.main, "transcribe an audio file"),
     "mic": (mic_mod.main, "record from mic and transcribe (real-time test)"),
     "optimize": (optimize_mod.main, "quantize + export a checkpoint"),
+    "probe": (probe_mod.main, "encoder-collapse probe + greedy holdout eval"),
+    "devices": (devices_mod, "detect available compute devices (CUDA/MPS/CPU)"),
 }
 
 

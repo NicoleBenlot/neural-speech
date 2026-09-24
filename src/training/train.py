@@ -26,6 +26,7 @@ from src.data.dataset import (
     _rows_to_dataset,
 )
 from src.data.prepare import write_manifest
+from src.device_info import auto_device, resolve_device, summarize
 from src.models.stt import STTConfig, STTModel, build_stt_model
 from src.tokens.tokenizer import BLANK, CharTokenizer
 from src.training.checkpoint import CheckpointManager, TrainingState
@@ -33,6 +34,12 @@ from src.training.metrics import cer, compute_metrics, wer
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+_BACKBONE_ALIASES = {
+    "fb": "facebook/mms-300m",
+    "mms": "facebook/mms-300m",
+    "mms-300m": "facebook/mms-300m",
+}
 
 
 def set_seed(seed: int):
@@ -65,19 +72,11 @@ class TrainConfig:
     max_audio_len: int = 5
     max_text_len: int = 64
     beam_size: int = 5
+    retain_every: int = 10
+    retain_protect: List[str] = field(default_factory=list)
     model: STTConfig = field(default_factory=STTConfig)
 
     sample_rate: int = 16000
-
-
-def resolve_device(device: str) -> torch.device:
-    if device == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    return torch.device(device)
 
 
 def _is_true_env_flag(name: str) -> bool:
@@ -179,13 +178,21 @@ class Trainer:
 
         if self.optimizer is None:
             opt_name = self.config.optimizer.lower()
+            trainable = list(
+                filter(lambda p: p.requires_grad, self.model.parameters())
+            )
+            logger.info(
+                "Trainable params: %d / %d",
+                sum(p.numel() for p in trainable),
+                sum(p.numel() for p in self.model.parameters()),
+            )
             if opt_name in ("adamw", "adam"):
                 self.optimizer = torch.optim.AdamW(
-                    self.model.parameters(), lr=self.config.learning_rate
+                    trainable, lr=self.config.learning_rate
                 )
             elif opt_name == "sgd":
                 self.optimizer = torch.optim.SGD(
-                    self.model.parameters(), lr=self.config.learning_rate
+                    trainable, lr=self.config.learning_rate
                 )
             else:
                 raise ValueError(f"Unsupported optimizer: {self.config.optimizer}")
@@ -204,10 +211,13 @@ class Trainer:
         self.model.to(self.device)
 
         opt_name = self.config.optimizer.lower()
+        trainable = list(
+            filter(lambda p: p.requires_grad, self.model.parameters())
+        )
         if opt_name in ("adamw", "adam"):
-            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate)
+            self.optimizer = torch.optim.AdamW(trainable, lr=self.config.learning_rate)
         elif opt_name == "sgd":
-            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.config.learning_rate)
+            self.optimizer = torch.optim.SGD(trainable, lr=self.config.learning_rate)
         else:
             raise ValueError(f"Unsupported optimizer: {self.config.optimizer}")
 
@@ -288,8 +298,17 @@ class Trainer:
 
         self.use_amp = self.config.mixed_precision and self.device.type == "cuda"
         self.scaler = (
-            torch.cuda.amp.GradScaler(enabled=self.use_amp) if self.use_amp else None
+            torch.amp.GradScaler("cuda", enabled=self.use_amp)
+            if self.use_amp
+            else None
         )
+        logger.info(
+            "Using device: %s (AMP=%s); auto would select %s",
+            self.device,
+            self.use_amp,
+            auto_device(),
+        )
+        logger.info("\n".join(summarize()))
 
         start_epoch = self.state.epoch
         for epoch in range(start_epoch, self.config.epochs):
@@ -331,6 +350,7 @@ class Trainer:
                     }
                 )
                 self.last_saved = True
+                self._prune_checkpoints()
 
         # Regression eval when incremental
         if self.config.from_checkpoint and self.config.eval_manifest:
@@ -352,6 +372,8 @@ class Trainer:
             )
         else:
             self.manager.update_latest_state(self.state)
+
+        self._prune_checkpoints()
 
     def _train_epoch(
         self,
@@ -403,7 +425,8 @@ class Trainer:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.grad_clip
+                    filter(lambda p: p.requires_grad, self.model.parameters()),
+                    self.config.grad_clip,
                 )
 
             if self.scaler is not None:
@@ -598,6 +621,15 @@ class Trainer:
             str(rng_path),
         )
 
+    def _prune_checkpoints(self):
+        if self.config.retain_every == 0 and not self.config.retain_protect:
+            return
+        self.manager.prune(
+            retain_every=self.config.retain_every,
+            keep_best=True,
+            protect=self.config.retain_protect,
+        )
+
     def _regression_eval(self):
         """Evaluate new model on old/reference data to detect forgetting."""
         eval_manifest = Path(self.config.eval_manifest)
@@ -627,14 +659,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Train or continue training the STT model"
     )
     parser.add_argument("--dataset", default="data/processed/manifest.csv")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("-b", "--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("-e", "--epochs", type=int, default=30)
     parser.add_argument("--optimizer", default="AdamW", choices=["AdamW", "SGD"])
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("-d", "--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("-c", "--checkpoint-dir", default="checkpoints")
     parser.add_argument("--validation-frequency", type=int, default=1)
     parser.add_argument("--replay-ratio", type=float, default=0.0)
     parser.add_argument("--replay-manifest", default=None)
@@ -643,7 +675,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-manifest", default=None)
     parser.add_argument("--no-fp16", action="store_true", help="Disable mixed precision")
     parser.add_argument("--split-dir", default="data/processed")
-    parser.add_argument("--max-text-len", type=int, default=64)
+    parser.add_argument("-mtl", "--max-text-len", type=int, default=64)
     parser.add_argument("--beam-size", type=int, default=5, help="Beam width for eval decoding (1 = greedy)")
     parser.add_argument("--model-d-model", type=int, default=128)
     parser.add_argument("--model-heads", type=int, default=4)
@@ -655,6 +687,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["decoder", "ctc"],
         help="Head: 'decoder' (seq2seq, teacher-forced CE) or 'ctc' (CTC head, "
         "diagnostic). CTC disables teacher forcing entirely.",
+    )
+    parser.add_argument(
+        "-m",
+        "--model-backbone",
+        default="none",
+        help="Pretrained acoustic backbone. 'none' = from-scratch encoder. "
+        "E.g. 'facebook/mms-300m' (hidden 1024, 24 layers, ~315M params, "
+        "self-supervised on 1,406 languages incl. ceb). Aliases: 'fb'/'mms' "
+        "= facebook/mms-300m.",
+    )
+    parser.add_argument(
+        "--backbone-unfreeze-layers",
+        type=int,
+        default=4,
+        help="Last K transformer layers of the backbone left trainable "
+        "(standard low-resource fine-tuning; everything else frozen).",
+    )
+    parser.add_argument(
+        "--retain-every",
+        type=int,
+        default=10,
+        help="Checkpoint retention: keep every Nth version plus the best-val-loss "
+        "and final versions, deleting the rest after each validated save. "
+        "0 = keep every version (old behaviour). Default 10.",
+    )
+    parser.add_argument(
+        "--retain-protect",
+        action="append",
+        default=[],
+        metavar="VERSION",
+        help="Never delete this version dir (e.g. --retain-protect v026). "
+        "Repeatable. Independent of the milestone/best/final keep-set.",
     )
     return parser
 
@@ -670,6 +734,8 @@ def main():
         encoder_layers=args.model_encoder_layers,
         decoder_layers=args.model_decoder_layers,
         head=args.model_head,
+        backbone=_BACKBONE_ALIASES.get(args.model_backbone, args.model_backbone),
+        backbone_unfreeze_layers=args.backbone_unfreeze_layers,
     )
     config = TrainConfig(
         batch_size=args.batch_size,
@@ -691,6 +757,8 @@ def main():
         eval_manifest=args.eval_manifest,
         max_text_len=args.max_text_len,
         beam_size=args.beam_size,
+        retain_every=args.retain_every,
+        retain_protect=args.retain_protect,
         model=model_config,
     )
 

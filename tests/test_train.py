@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from src.training.train import TrainConfig, Trainer, set_seed
+from src.training.train import _BACKBONE_ALIASES, build_arg_parser, TrainConfig, Trainer, set_seed
 from src.training.checkpoint import CheckpointManager
 from src.models.stt import STTConfig
 
@@ -34,6 +34,9 @@ def base_config(tmp_path: Path, tiny_manifest: Path):
         "device": "cpu",
         "mixed_precision": False,
         "eval_manifest": None,
+        # These tests exercise version immutability/resume, not retention;
+        # opt out of auto-pruning so every version stays on disk.
+        "retain_every": 0,
         "model": _tiny_model_config(),
     }
 
@@ -101,3 +104,23 @@ def test_incremental_from_checkpoint(base_config, tmp_path):
     data = manager.load("v002")
     assert data["state"].parent_checkpoint == "v001"
     assert data["manifest"]["replay_ratio"] == 0.3
+
+
+def test_short_flag_aliases():
+    args = build_arg_parser().parse_args(
+        ["-m", "fb", "-c", "checkpoints/mms-sent", "-e", "30", "-b", "10", "-mtl", "123", "-d", "auto"]
+    )
+    assert args.model_backbone == "fb"
+    assert _BACKBONE_ALIASES[args.model_backbone] == "facebook/mms-300m"
+    assert args.checkpoint_dir == "checkpoints/mms-sent"
+    assert args.epochs == 30
+    assert args.batch_size == 10
+    assert args.max_text_len == 123
+    assert args.device == "auto"
+
+
+def test_backbone_aliases_all_map_to_mms():
+    assert _BACKBONE_ALIASES["fb"] == "facebook/mms-300m"
+    assert _BACKBONE_ALIASES["mms"] == "facebook/mms-300m"
+    assert _BACKBONE_ALIASES["mms-300m"] == "facebook/mms-300m"
+    assert "none" not in _BACKBONE_ALIASES

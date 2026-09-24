@@ -1,0 +1,64 @@
+Important commands (run from repo root, always with the venv python: .venv\Scripts\python.exe or `python` if venv is active):
+
+Data prep:
+python ns.py prepare                          # index.txt -> data/processed/manifest.csv
+python ns.py validate --fail-on-error         # dataset checks
+
+Train (short flags; -d auto picks CUDA -> MPS -> CPU):
+python ns.py -m fb -c checkpoints/mms-sent -e 30 -b 10 -mtl 123 -d auto
+python ns.py train                            # full long-form flags, defaults
+python ns.py train --help                     # full flag list
+
+Train long-form (equivalent, with extras):
+python ns.py --model-backbone facebook/mms-300m --backbone-unfreeze-layers 4 `
+  --checkpoint-dir checkpoints/mms-sent --epochs 30 --learning-rate 3e-4 `
+  --batch-size 8 --max-text-len 128 --device cuda
+
+Short-flag map: -m model backbone (fb/mms/mms-300m = facebook/mms-300m; none = from scratch)
+                 -c checkpoint dir (writable line, e.g. checkpoints/mms-sent)
+                 -e epochs   -b batch size   -mtl max text len   -d device (auto|cuda|cpu)
+
+Continue the existing MMS line (resume optimizer/Scheduler/epoch/RNG):
+python ns.py -m fb -c checkpoints/mms --resume checkpoints/mms
+
+Resume / safety flags:
+--resume <dir>            restores optimizer/scheduler/epoch/RNG from a kept version
+--from-checkpoint <dir>   incremental: fresh optimizer, records parent_checkpoint
+--eval-manifest <old-csv> regression eval vs. previous data
+--retain-every 10         checkpoint auto-pruning (0 = keep all). Default 10.
+--retain-protect vNNN     never delete this version (repeatable)
+
+Inference:
+python ns.py transcribe <audio> --checkpoint checkpoints/mms-sent/latest --device cuda
+python ns.py mic --seconds 5                  # live mic test
+python ns.py mic --loop --seconds 3           # keep going until Ctrl+C
+python ns.py probe --checkpoint checkpoints/mms-sent/latest   # encoder-collapse check
+
+Deploy / env:
+python ns.py optimize                         # INT8 quant + ONNX export
+python ns.py devices                          # detect compute devices
+python ns.py devices --check cuda             # resolve a device string
+uvicorn src.api.main:app --port 8000          # FastAPI
+python -m pytest tests -q                     # 98 tests
+
+Sentences (this afternoon):
+1. Put sentence audio in data/raw/assets/ as <id>.opus
+2. Add lines to data/raw/index.txt:  sentence text = <id>
+3. python ns.py prepare
+4. python ns.py validate --fail-on-error
+5. python ns.py -m fb -c checkpoints/mms-sent -e 30 -b 10 -mtl 128 -d auto
+   (VRAM: with long sentence audio on the 6GB GPU, drop to -b 8 / -b 4 if OOM)
+
+Checkpoints on your flash drive (D:):
+Copy-Item -Recurse checkpoints\mms "D:\neural-speech-checkpoints\mms"   # 3.1 GB
+# then use it from anywhere: python ns.py transcribe a.opus --checkpoint D:\neural-speech-checkpoints\mms\latest
+# continue training from the drive: python ns.py -m fb -c <line> --resume D:\neural-speech-checkpoints\mms\v026
+
+Run on another PC (torch lives in .venv, NOT in the repo / git):
+1. copy the repo folder but SKIP .venv/ and checkpoints/ (both git-ignored), or git clone it
+2. cd repo && python -m venv .venv && .venv\Scripts\activate
+3. pip install -r requirements.txt            # picks CPU torch; any PC works
+4. NVIDIA GPU there? then also:
+   pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu130 torch torchaudio
+   (use cu121/cu124 etc. matching that GPU's driver) 
+5. copy checkpoints from the flash drive into checkpoints/ (or pass --checkpoint/-c D:\... paths directly)

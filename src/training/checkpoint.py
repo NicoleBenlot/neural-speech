@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -113,6 +114,90 @@ class CheckpointManager:
             "latest": True,
         }
         self.latest_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def versions(self) -> List[int]:
+        """Sorted ordinal list of every version dir under this root."""
+        return sorted(
+            int(m.group(1))
+            for p in self.root.iterdir()
+            if (m := _VERSION_RE.match(p.name))
+        )
+
+    def version_metrics(self, version: int) -> Dict[str, Any]:
+        """Best-effort summary of a version from its training_state.json."""
+        info: Dict[str, Any] = {
+            "version": version,
+            "path": str(self.version_dir(version)),
+        }
+        state_file = self.version_dir(version) / "training_state.json"
+        if state_file.exists():
+            try:
+                info.update(json.loads(state_file.read_text(encoding="utf-8")))
+            except (ValueError, OSError):
+                pass
+        return info
+
+    def prune(
+        self,
+        retain_every: int = 10,
+        keep_best: bool = True,
+        protect: Optional[List[str]] = None,
+        dry_run: bool = False,
+    ) -> List[Path]:
+        """Delete checkpoint versions outside the retention policy.
+
+        Retention policy (applied going forward and safe to reuse retroactively):
+          * the final (newest) version — always kept (``latest.json`` stays valid)
+          * the best version by ``validation_loss`` (if any real measurement exists)
+          * every version whose ordinal is a multiple of ``retain_every``
+            (diagnostic trend visibility; ``retain_every=0`` keeps only the
+            final + best)
+          * anything in ``protect`` (exact names like ``"v026"`` or paths) —
+            never deleted
+
+        The final version is always retained, so ``--resume .../latest`` keeps
+        working; resuming from an explicitly-pruned intermediate version does not.
+
+        Returns the deleted version dirs. With ``dry_run=True`` nothing is
+        deleted and the would-be deletions are returned.
+        """
+        vers = self.versions()
+        if not vers:
+            return []
+
+        protect_nums = set()
+        for entry in protect or []:
+            entry = str(entry).strip()
+            m = _VERSION_RE.match(entry)
+            if m:
+                protect_nums.add(int(m.group(1)))
+            else:
+                try:
+                    protect_nums.add(int(entry))
+                except ValueError:
+                    logger.warning("Ignoring unknown --retain-protect value: %r", entry)
+
+        keep: set = {vers[-1]}
+        if keep_best:
+            measured = [
+                self.version_metrics(v)
+                for v in vers
+                if self.version_metrics(v).get("validation_loss", 0.0) > 0.0
+            ]
+            if measured:
+                keep.add(min(measured, key=lambda info: info["validation_loss"])["version"])
+        if retain_every and retain_every > 0:
+            keep.update(v for v in vers if v % retain_every == 0)
+        keep.update(protect_nums)
+
+        to_delete = [self.version_dir(v) for v in vers if v not in keep]
+        for path in to_delete:
+            if dry_run:
+                logger.info("[dry-run] retention would delete %s", path)
+            else:
+                logger.warning("Retention policy: deleting %s", path)
+                shutil.rmtree(path, ignore_errors=True)
+        return to_delete
 
     def update_latest_state(self, state: TrainingState):
         """Rewrite the training_state.json of the current latest version.

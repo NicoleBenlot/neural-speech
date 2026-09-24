@@ -67,3 +67,36 @@ def test_missing_index_file(tmp_path):
     result = parse_index(tmp_path / "missing.txt")
     assert result.error_count == 1
     assert result.entry_count == 0
+
+
+def test_sentence_entry_with_spaces():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        idx = Path(td) / "index.txt"
+        idx.write_text(
+            "[sentences]\n"
+            "ang bata nagdula sa bola = 196\n"
+            "maayo nga adlaw kaninyo! = 197\n"
+            "hello = 1\n",
+            encoding="utf-8",
+        )
+        result = parse_index(idx, assets_dir=Path(td) / "assets")
+        assert result.error_count == 0
+        assert result.entry_count == 3
+        by_id = {e.id: e for e in result.entries}
+        assert by_id[196].text == "ang bata nagdula sa bola"
+        assert by_id[196].section == "sentences"
+        assert by_id[197].text == "maayo nga adlaw kaninyo!"
+        assert by_id[197].audio_path.endswith(os.path.join("assets", "197.opus"))
+        assert by_id[1].text == "hello"
+
+
+def test_sentence_entry_extra_whitespace_around_equals():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        idx = Path(td) / "index.txt"
+        idx.write_text("nindot  kaayo   =   198   \n", encoding="utf-8")
+        result = parse_index(idx, assets_dir=Path(td) / "assets")
+        assert result.error_count == 0
+        assert result.entries[0].text == "nindot  kaayo"
+        assert result.entries[0].id == 198
