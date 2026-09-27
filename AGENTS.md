@@ -33,7 +33,7 @@ python -m src.training.train
 python -m src.inference.transcriber <audio> --checkpoint checkpoints/latest
 python -m src.deploy.optimize
 uvicorn src.api.main:app --port 8000        # FastAPI (model loaded once at startup)
-python -m pytest tests -q                   # 148 tests; no real dataset needed
+python -m pytest tests -q                   # 159 tests; no real dataset needed
 ```
 
 `ns.py` is a shell-agnostic wrapper: it forwards all subcommand args verbatim to the
@@ -147,6 +147,21 @@ Device selection is portable: every CLI that touches a model takes `--device`
 availability; requesting a device this machine lacks raises a ValueError that
 lists what it has (instead of a late CUDA crash). `ns.py devices` prints that
 list and what `--device auto` would select.
+
+## Kaggle (training target)
+
+Training runs on Kaggle; this Windows checkout is the test bed. The port is
+**isolated in `kaggle/`** — `src/` and `ns.py` are never made Linux-aware:
+`kaggle/make_upload.py` rewrites Windows separators to `/` in *copies* of the
+artifacts that store paths (`data/processed/manifest*.csv` `audio`,
+`split_*.json` `audio_path`, `latest.json`/`best.json` `path`/`dataset`/
+`replay_manifest`) and re-verifies the zips. Ids, text, metrics and the manifest
+fingerprint are copied byte-for-byte, so a split is never silently rebuilt with
+different rows. The per-split `manifest.tsv` needs no rewrite (its `filename`
+column is a bare basename the registry joins at read time). `kaggle/dist/` is
+git-ignored. Full runbook, including the notebook cells, is `kaggle/README.md`;
+`--resume checkpoints/mms/vNNN` (not `-continue`) is what carries optimizer,
+scheduler, epoch and RNG state across.
 
 ## Gotchas (all hit in practice)
 
@@ -281,5 +296,6 @@ list and what `--device auto` would select.
 - `src/deploy/onnx_export.py` TensorRT path is skipped gracefully when
   unavailable. Windows paths use backslashes — tests must use `os.path.join`
   when asserting path suffixes. Manifests and `latest.json`/`best.json` therefore
-  store OS-native separators: **they are not portable to Linux as-is.** Anything
-  targeting Linux rewrites them at upload time; the local pipeline never needs it.
+  store OS-native separators: **they are not portable to Linux as-is.** The Kaggle
+  port rewrites them at upload time instead (see `kaggle/README.md`); the local
+  pipeline never needs it.

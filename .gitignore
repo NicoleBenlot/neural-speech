@@ -17,3 +17,6 @@ huggingfacedata.py
 movedata.py
 _smoke/
 .DS_Store
+
+# Kaggle upload bundles (multi-GB zips, rebuilt by kaggle/make_upload.py)
+kaggle/dist/

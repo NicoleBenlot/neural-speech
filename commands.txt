@@ -198,3 +198,8 @@ Run on another PC (torch lives in the venv you create, NOT in the repo / git):
    (use cu121/cu124 etc. matching that GPU's driver)
 5. copy checkpoints from the flash drive into checkpoints/ (or pass --checkpoint/-c D:\... paths directly)
 6. re-create the dataset blobs: data/raw/assets (or run the FLEURS export) - they are git-ignored
+
+Train on Kaggle instead (Linux box; the port is isolated from the local pipeline):
+   kaggle\README.md                          # full runbook: build, upload, resume, download
+   python kaggle/make_upload.py --version v004   # -> kaggle/dist/{code,data,ckpt}.zip
+   kaggle\make_upload.py --no-audio --version v004   # fast dry run (rewrites + verify only)
