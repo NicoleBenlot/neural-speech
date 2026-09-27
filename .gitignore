@@ -12,5 +12,8 @@ checkpoints/*
 !checkpoints/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+data/fleurs_ceb_ph/
+huggingfacedata.py
+movedata.py
 _smoke/
 .DS_Store

@@ -16,7 +16,12 @@ from src.training.train import (
 )
 from src.training.checkpoint import CheckpointManager
 from src.models.stt import STTConfig
-from src.data.dataset import manifest_fingerprint, split_fingerprint
+from src.data.dataset import (
+    LengthGroupedBatchSampler,
+    manifest_fingerprint,
+    read_manifest,
+    split_fingerprint,
+)
 
 
 def _tiny_model_config():
@@ -113,6 +118,82 @@ def test_incremental_from_checkpoint(base_config, tmp_path):
     data = manager.load("v002")
     assert data["state"].parent_checkpoint == "v001"
     assert data["manifest"]["replay_ratio"] == 0.3
+
+
+def test_incremental_run_starts_from_parent_weights(base_config):
+    """-continue/--from-checkpoint must carry the parent's trained tensors over.
+
+    Regression guard: the incremental path used to build a brand-new model from
+    the pretrained backbone only, silently throwing away every fine-tuned
+    weight the parent had learned.
+    """
+    config = dict(base_config, epochs=1)
+    set_seed(2)
+    Trainer(TrainConfig(**config)).train()
+
+    parent = CheckpointManager(config["checkpoint_dir"]).load("v001")
+    parent_sd = parent["model_sd"]
+
+    trainer = Trainer(TrainConfig(**dict(config, from_checkpoint="v001")))
+    trainer._prepare_epoch_from_checkpoint()
+    trainer._load_datasets()
+    trainer._build_model_and_optimizer()
+
+    own = trainer.model.state_dict()
+    assert set(own) == set(parent_sd)
+    for key, value in own.items():
+        assert torch.equal(value, parent_sd[key]), f"{key} was not inherited"
+
+
+def test_incremental_run_extends_parent_vocabulary(base_config, tmp_path):
+    """New characters are appended (old ids keep their trained embeddings)."""
+    config = dict(base_config, epochs=1)
+    set_seed(3)
+    Trainer(TrainConfig(**config)).train()
+    parent = CheckpointManager(config["checkpoint_dir"]).load("v001")
+    parent_vocab = dict(parent["tokenizer"].char_to_id)
+    parent_vocab_size = len(parent_vocab)
+
+    # Same audio, new transcripts containing characters the parent never saw.
+    assets = Path(config["dataset"]).parent / "assets"
+    new_manifest = tmp_path / "new" / "manifest.csv"
+    new_manifest.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        f"{900 + i},{assets / f'{100 + i}.wav'},zebra {text}"
+        for i, text in enumerate(["quox!", "jinx?", "wombat"])
+    ]
+    new_manifest.write_text(
+        "id,audio,text,section\n" + "\n".join(rows), encoding="utf-8"
+    )
+
+    trainer = Trainer(
+        TrainConfig(
+            **dict(
+                config,
+                dataset=str(new_manifest),
+                from_checkpoint="v001",
+                split_dir=str(tmp_path / "new_processed"),
+            )
+        )
+    )
+    trainer._prepare_epoch_from_checkpoint()
+    trainer._load_datasets()
+    trainer._build_model_and_optimizer()
+
+    # parent ids are untouched; only the new characters were appended
+    for token, token_id in parent_vocab.items():
+        assert trainer.tokenizer.char_to_id[token] == token_id
+    new_chars = set("".join("zebra quox!jinx?wombat")) - set(parent_vocab)
+    assert trainer.tokenizer.vocab_size() == parent_vocab_size + len(new_chars)
+    assert trainer.model.vocab_size == trainer.tokenizer.vocab_size()
+
+    # the vocabulary-sized tensors are the only ones allowed to be fresh
+    own = trainer.model.state_dict()
+    resized = {"decoder.embed.weight", "decoder.out.weight", "decoder.out.bias"}
+    inherited = [k for k in own if k not in resized]
+    assert inherited
+    for key in inherited:
+        assert torch.equal(own[key], parent["model_sd"][key]), f"{key} was not inherited"
 
 
 def test_short_flag_aliases():
@@ -273,3 +354,57 @@ def test_lr_flags_wire_into_config_and_defaults():
     assert TrainConfig().lr_patience == 5
     assert defaults.retain_every == 0
     assert TrainConfig().retain_every == 0
+
+def test_train_batches_are_length_grouped(base_config):
+    """The train loader must not hand the encoder a batch padded to the epoch max."""
+    trainer = Trainer(TrainConfig(**dict(base_config, epochs=1)))
+    train_ds, _, _, _ = trainer._load_datasets()
+    loader = trainer._build_loader(train_ds, shuffle=True)
+
+    assert isinstance(loader.batch_sampler, LengthGroupedBatchSampler)
+    assert len(loader.batch_sampler) == len(list(loader))
+    assert {b.ids.shape[0] for b in loader} <= {base_config["batch_size"]}
+
+    # the off-switch restores plain shuffled batches
+    plain_trainer = Trainer(TrainConfig(**dict(base_config, length_group=False)))
+    plain = plain_trainer._build_loader(train_ds, shuffle=True)
+    assert plain.batch_sampler is None or not isinstance(
+        plain.batch_sampler, LengthGroupedBatchSampler
+    )
+
+
+def test_max_batch_frames_caps_padded_samples(base_config):
+    trainer = Trainer(
+        TrainConfig(**dict(base_config, epochs=1, batch_size=8, max_batch_frames=4800))
+    )
+    train_ds, _, _, _ = trainer._load_datasets()
+    loader = trainer._build_loader(train_ds, shuffle=False)
+    for batch in loader:
+        padded = batch.audio.shape[0] * batch.audio.shape[2]
+        # 0.3s fixtures at 16 kHz = 4800 samples; the budget may only be exceeded
+        # by a single clip, which cannot be split any further
+        assert padded <= 4800 or batch.audio.shape[0] == 1
+
+
+def test_training_skips_batch_after_oom(base_config, monkeypatch):
+    """A device OOM drops one batch instead of killing the run."""
+    trainer = Trainer(TrainConfig(**dict(base_config, epochs=1)))
+    train_ds, _, _, _ = trainer._load_datasets()
+    trainer._build_model_and_optimizer()
+
+    original = trainer._batch_loss
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate ...")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "_batch_loss", flaky)
+    loader = trainer._build_loader(train_ds, shuffle=True)
+
+    loss, _, _ = trainer._train_epoch(loader, None, 0)
+    assert calls["n"] > 1  # the run continued past the failed batch
+    assert loss > 0
+

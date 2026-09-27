@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from src.data.audio import load_audio
 from src.tokens.tokenizer import CharTokenizer
@@ -26,6 +26,118 @@ class ManifestRow:
     audio_path: str
     text: str
     section: Optional[str] = None
+
+
+def probe_num_samples(
+    path: str, base_dir: Optional[Path] = None, sample_rate: int = 16000
+) -> int:
+    """Sample count of an audio file without decoding its samples.
+
+    Reads the container header only (soundfile), so it is cheap enough to run
+    over a whole manifest. Returns 0 when the file cannot be inspected, which
+    callers treat as "unknown length".
+    """
+    import soundfile as sf
+
+    candidates = [Path(path)]
+    if base_dir is not None and not Path(path).is_absolute():
+        candidates.append(base_dir / path)
+    for candidate in candidates:
+        try:
+            info = sf.info(str(candidate))
+        except Exception:  # unreadable header, missing file, no libsndfile
+            continue
+        if info.samplerate:
+            return int(round(info.frames * sample_rate / info.samplerate))
+    return 0
+
+
+class LengthGroupedBatchSampler(Sampler):
+    """Yield batches of similar-length clips so padding - and VRAM - stays small.
+
+    The classic length-grouped scheme: shuffle the indices, cut them into
+    megabatches, sort each megabatch by length, split into fixed-size batches,
+    then shuffle the *batch order* so epochs are still random. Only the
+    ordering changes; every sample is still seen exactly once per epoch.
+
+    ``max_frames`` additionally caps ``len(batch) * longest_clip_in_batch``,
+    which is the padded sample count the encoder actually sees and therefore
+    the direct bound on activation memory. With it, short clips still batch
+    together while one 40s outlier lands in a batch of its own instead of
+    inflating all of its neighbours.
+    """
+
+    def __init__(
+        self,
+        num_samples: List[int],
+        batch_size: int,
+        seed: int = 42,
+        megabatch_mult: int = 50,
+        max_frames: int = 0,
+        drop_last: bool = False,
+        shuffle: bool = True,
+    ):
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        self.num_samples = list(num_samples)
+        self.batch_size = batch_size
+        self.seed = seed
+        self.megabatch_mult = megabatch_mult
+        self.max_frames = max_frames
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+        self.epoch = 0
+        # Unknown lengths must not sort as "shortest" and get over-batched.
+        known = [n for n in self.num_samples if n > 0]
+        self._fallback = sorted(known)[len(known) // 2] if known else 0
+
+    def _key(self, idx: int) -> int:
+        n = self.num_samples[idx]
+        return n if n > 0 else self._fallback
+
+    def _batches(self, epoch: int) -> List[List[int]]:
+        indices = list(range(len(self.num_samples)))
+        if self.shuffle:
+            rng = random.Random(self.seed + epoch)
+            rng.shuffle(indices)
+
+        mega = self.batch_size * self.megabatch_mult
+        batches: List[List[int]] = []
+        for start in range(0, len(indices), mega):
+            chunk = sorted(indices[start : start + mega], key=self._key)
+            current: List[int] = []
+            for idx in chunk:
+                candidate = current + [idx]
+                longest = max(self._key(i) for i in candidate)
+                if current and (
+                    len(candidate) > self.batch_size
+                    or (
+                        self.max_frames
+                        and len(candidate) * longest > self.max_frames
+                    )
+                ):
+                    batches.append(current)
+                    current = [idx]
+                else:
+                    current = candidate
+            if current and not (self.drop_last and len(current) < self.batch_size):
+                batches.append(current)
+
+        if self.shuffle:
+            random.Random(self.seed + epoch).shuffle(batches)
+        return batches
+
+    def __iter__(self):
+        # Advance per pass so a shuffled sampler really reshuffles every epoch
+        # (a fixed order would hand the model the same batch sequence 30 times).
+        # shuffle=False keeps epoch 0, so eval loaders stay deterministic.
+        if self.shuffle:
+            self.epoch += 1
+        return iter(self._batches(self.epoch))
+
+    def __len__(self) -> int:
+        # Same count every epoch: ordering varies, batch sizes do not.
+        return len(self._batches(0))
 
 
 def read_manifest(manifest_path: Path) -> List[ManifestRow]:
@@ -45,7 +157,12 @@ def read_manifest(manifest_path: Path) -> List[ManifestRow]:
 
 
 class SpeechDataset(Dataset):
-    """Load audio-transcription pairs from a manifest."""
+    """Load audio-transcription pairs from a manifest.
+
+    Audio is decoded lazily in ``__getitem__`` and never cached, so only the
+    batch being trained on is resident. ``num_samples()`` reads headers only
+    (no decoding) to let a sampler group clips of similar duration.
+    """
 
     def __init__(
         self,
@@ -59,9 +176,21 @@ class SpeechDataset(Dataset):
         self.tokenizer = tokenizer
         self.sample_rate = sample_rate
         self.load_audio_samples = load_audio_samples
+        self._num_samples: Optional[List[int]] = None
 
     def __len__(self) -> int:
         return len(self.rows)
+
+    def num_samples(self) -> List[int]:
+        """Per-row sample count at ``self.sample_rate``, 0 when unreadable."""
+        if self._num_samples is None:
+            base = getattr(self, "manifest_path", None)
+            base = base.parent if base is not None else None
+            counts = []
+            for row in self.rows:
+                counts.append(probe_num_samples(row.audio_path, base, self.sample_rate))
+            self._num_samples = counts
+        return self._num_samples
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self.rows[idx]
@@ -219,6 +348,8 @@ def _rows_to_dataset(
     """Build a SpeechDataset from row dicts (used when loading saved splits)."""
     ds = SpeechDataset.__new__(SpeechDataset)
     ds.rows = [ManifestRow(id=int(r["id"]), audio_path=r["audio_path"], text=r["text"], section=r.get("section")) for r in rows]
+    ds.manifest_path = None
+    ds._num_samples = None
     ds.tokenizer = tokenizer
     ds.sample_rate = sample_rate
     ds.load_audio_samples = load_audio_samples

@@ -3,7 +3,8 @@
 Usage:
     python ns.py prepare [--index data/raw/index.txt] [--output data/processed/manifest.csv]
     python ns.py validate [--fail-on-error]
-    python ns.py train [--epochs 30] [--batch-size 8] [--device auto] ...
+    python ns.py datasets [--data fleurs_ceb_ph] [--build]
+    python ns.py train [--data default|fleurs_ceb_ph] [--epochs 30] [--batch-size 8] [--device auto] ...
     python ns.py transcribe <audio> [--checkpoint checkpoints/mms/latest]
     python ns.py optimize [--checkpoint checkpoints/mms/latest]
 
@@ -18,6 +19,7 @@ import sys
 from typing import Dict, Tuple
 
 from src.data import prepare as prepare_mod
+from src.data import registry as registry_mod
 from src.data import validate as validate_mod
 from src.deploy import optimize as optimize_mod
 from src.device_info import main as devices_mod
@@ -29,12 +31,21 @@ from src.training import train as train_mod
 COMMANDS: Dict[str, tuple] = {
     "prepare": (prepare_mod.main, "index.txt -> data/processed/manifest.csv"),
     "validate": (validate_mod.main, "dataset integrity checks"),
+    "datasets": (registry_mod.main, "list/resolve --data datasets and their splits"),
     "train": (train_mod.main, "train the STT model"),
     "transcribe": (transcribe_mod.main, "transcribe an audio file"),
     "mic": (mic_mod.main, "record from mic and transcribe (real-time test)"),
     "optimize": (optimize_mod.main, "quantize + export a checkpoint"),
     "probe": (probe_mod.main, "encoder-collapse probe + greedy holdout eval"),
     "devices": (devices_mod, "detect available compute devices (CUDA/MPS/CPU)"),
+}
+
+# Flags that make `ns.py <flag> ...` mean `ns.py train <flag> ...`.
+TRAIN_FLAGS = {
+    "-new", "--new", "-continue", "--continue", "-resume", "--resume",
+    "-m", "--model-backbone", "-c", "--checkpoint-dir",
+    "-e", "--epochs", "-b", "--batch-size", "-d", "--device",
+    "--data", "--dataset", "--replay-manifest", "--from-checkpoint",
 }
 
 
@@ -51,14 +62,8 @@ def _invoke(module_main, argv: list) -> int:
 
 def main() -> int:
     raw_args = sys.argv[1:]
-    _TRAIN_FLAGS = {
-        "-new", "--new", "-continue", "--continue", "-resume", "--resume",
-        "-m", "--model-backbone", "-c", "--checkpoint-dir",
-        "-e", "--epochs", "-b", "--batch-size", "-d", "--device",
-        "--dataset", "--replay-manifest", "--from-checkpoint",
-    }
     if raw_args and raw_args[0] not in COMMANDS and (
-        raw_args[0] in _TRAIN_FLAGS
+        raw_args[0] in TRAIN_FLAGS
         or "-m" in raw_args
         or "--model-backbone" in raw_args
     ):

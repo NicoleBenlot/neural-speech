@@ -1,9 +1,24 @@
-Important commands (run from repo root, always with the venv python: .venv\Scripts\python.exe or `python` if venv is active):
+All neural-speech commands (run from the repo root; this PC uses the system
+Python 3.14 directly - there is no .venv here. On a fresh PC create one, see the
+last section).
 
 NOTES TO KNOW BEFOREHAND:
-- Always use the VENV python (.venv\Scripts\python.exe), never the base D:\python one.
-  venv has the GPU torch (cu130); base D:\python has the old CPU build.
+- This PC: `python` = native Python 3.14 with torch 2.14.0+cu130 / torchaudio
+  2.11.0+cu130 (CUDA 13.0 wheel index). Base interpreter is NOT the old CPU build.
 - -d auto picks CUDA -> MPS -> CPU for you; fp16 AMP turns itself ON for CUDA.
+- DATASETS are selected with `--data` (name, dataset dir, or manifest path):
+    default        = data/processed/manifest.csv  (from `ns.py prepare`, random 80/10/10)
+    fleurs_ceb_ph  = data/fleurs_ceb_ph/{train,validation,test} (OFFICIAL splits)
+  `--data` and `--dataset` are mutually exclusive. `python ns.py datasets` lists
+  them and shows whether the source files are present.
+- -mtl/--max-text-len caps how many tokens DECODING may emit per utterance - it
+  affects every CER/WER you see, never the training loss (batching pads to the
+  longest target in the batch). A cap shorter than the reference truncates the
+  hypothesis and inflates CER for no model reason. FLEURS transcripts are long
+  (median 144, p90 214, max 381 chars): -mtl 64 truncates 98% of them, 128 -> 64%,
+  200 -> 15%, 256 -> 2.7%, 300 -> 0.8%, 384 -> 0%. Cost is decode time, which is
+  autoregressive, so a bigger cap makes evaluation slower. `Trainer` logs a
+  warning at startup if the cap is too small. No audio-length cap exists.
 - Checkpoints auto-prune after every saved epoch: keep = recorded best (best.json)
   + final + best-val-loss. Positive --retain-every N also keeps every Nth version;
   default 0 is best-only plus final. Use a negative value to disable pruning, and
@@ -15,64 +30,145 @@ NOTES TO KNOW BEFOREHAND:
   (dataset-aware, can't be shadowed by an older dataset's lower val_loss); prune
   protects both. Use `best` anywhere a checkpoint is accepted: -resume best,
   --from-checkpoint best, --checkpoint checkpoints/mms/best.
-- Checkpoints/mms now holds ONLY v026 (best) + v030 (final) = 3.1 GB. Weights are never in git.
-- index.txt now supports SENTENCES: "ang bata nagdula sa bola = 196" (multi-word OK, id = filename).
-- No audio-length cap; only --max-text-len (default 64) limits decode. Long sentences: raise to 128.
-- 6 GB GPU: batch too big = CUDA out of memory (OOM). Drop -b 8 -> -b 4.
-- Audio loads via soundfile fallback automatically - real .opus works even without FFmpeg full-shared.
-- .venv is NOT portable between PCs - recreate with pip install -r requirements.txt.
-  (.venv and checkpoints/ are git-ignored; GitHub never stores them.)
-- bash = Git for Windows. New terminals pick it up (C:\Program Files\Git\bin added to user PATH).
-- Flash drive D: = "KINGSTONE E". copy_repo.sh pushes/pulls the repo (skips .venv + caches).
-  Off-site alternative if you ever need version history: DVC/cloud with the same keep-set policy.
-- The 3 training modes are mutually exclusive: pick ONE of -new / -continue / -resume (never combine).
+- checkpoints/mms currently holds v004 only (epoch 26, val_loss 1.4005,
+  CER 0.2630, WER 0.7419; trained on data/processed/manifest.csv, the 318-row
+  word set). A -continue into it creates v005, v006, ... Weights are never in git.
+- index.txt supports SENTENCES: "ang bata nagdula sa bola = 196" (multi-word OK,
+  id = filename).
+- 6 GB GPU: memory is bounded by the PADDED samples per batch (batch size x
+  longest clip in it), and FLEURS sentences are 10x longer than the word clips
+  (median 13.0s / 651 frames vs 1.3s / 65). Batches are length-grouped by
+  default (clips of similar duration batched together, reshuffled every epoch),
+  and --max-batch-frames caps the padded total directly - that flag, not -b, is
+  what keeps long-audio training inside 6 GB. Measured on this 3050 (MMS-300m,
+  last 4 layers unfrozen, fp16, real FLEURS):
+      --max-batch-frames  400k ->  2.1GB peak, 2421 batches/epoch, 12.5 min/epoch
+      --max-batch-frames  800k ->  2.7GB peak, 1065 batches/epoch,  9.9 min/epoch  <-- best
+      --max-batch-frames  1.6M ->  3.7GB peak,  521 batches/epoch, 15.0 min/epoch
+      --max-batch-frames  3.2M ->  5.4GB peak,  416 batches/epoch, 21.7 min/epoch
+      --max-batch-frames  6M   ->  6.1GB peak  = the OOM you hit
+  Bigger is not faster past 800k (quadratic attention + fewer, larger steps).
+  If a batch still OOMs it is logged and SKIPPED, not fatal, so a long run
+  survives a spike. -b still caps the clip count per batch (default 8).
+  --num-workers 2 overlaps audio decoding with compute (verified working).
+- Audio loads via soundfile fallback automatically - real .opus works even without
+  FFmpeg full-shared. Long-sentence audio also wants a smaller -b on a 6 GB card.
+- FLEURS export (data/fleurs_ceb_ph/, git-ignored, re-create with the ignored
+  huggingfacedata.py / movedata.py helpers): manifest.tsv is written unquoted and
+  37 rows carry a `"` + a trailing tab inside `transcript`, so it is parsed by
+  plain tab splitting, never csv.
+- bash = Git for Windows. New terminals pick it up (C:\Program Files\Git\bin added
+  to user PATH).
+- Flash drive D: = "KINGSTONE E". copy_repo.sh pushes/pulls the repo (skips
+  caches + data blobs). Off-site alternative if you ever need version history:
+  DVC/cloud with the same keep-set policy.
+- The 3 training modes are mutually exclusive: pick ONE of -new / -continue /
+  -resume (never combine).
 
 Data prep:
 python ns.py prepare                          # index.txt -> data/processed/manifest.csv
-python ns.py validate --fail-on-error         # dataset checks
+python ns.py prepare --index data/raw/index.txt --output data/processed/manifest.csv
+python ns.py validate --fail-on-error         # dataset checks (exits 1 on errors)
+python ns.py validate --index data/raw/index.txt --assets data/raw/assets
+
+Datasets (--data registry):
+python ns.py datasets                         # list datasets + whether sources exist
+python ns.py datasets --data fleurs_ceb_ph    # resolve one, print rows per split
+python ns.py datasets --data fleurs_ceb_ph --build          # force manifest rebuild
+python ns.py datasets --data fleurs_ceb_ph --text-field raw_transcript
+python ns.py datasets --data fleurs_ceb_ph --json          # machine-readable
+python ns.py datasets --data data/processed/manifest.csv     # plain manifest path
+python ns.py datasets --data data/fleurs_ceb_ph             # ad-hoc dataset dir
 
 Train - three modes, always pick exactly ONE (-d auto picks CUDA -> MPS -> CPU):
 python ns.py train -new -d auto -e 30               # 1) FRESH RUN on current data (rebuilds tokenizer + splits)
+python ns.py train -new --data default -e 30        #    explicit: data/processed/manifest.csv, random 80/10/10
+python ns.py train -new --data fleurs_ceb_ph -mtl 300 -e 30   # FLEURS, official train/val/test
 python ns.py train -continue -d auto -e 30          # 2) CONTINUE from BEST val-loss version onto NEW data (auto replay + regression)
 python ns.py train -continue latest -d auto -e 30   #    same, but parent = newest version
 python ns.py train -resume -d auto -e 30            # 3) RESUME the SAME run/data (optimizer/scheduler/epoch/RNG); auto = newest line's latest
-python ns.py train -resume <version-or-path> ...    #    explicit resume target (e.g. v026 or checkpoints/mms/v026)
+python ns.py train -resume <version-or-path> ...    #    explicit resume target (e.g. v004 or checkpoints/mms/v004)
 python ns.py train --from-checkpoint <dir> ...      #    manual incremental parent (no auto-wiring)
 python ns.py train --help                           # full flag list
+
+Continue onto the new FLEURS data (parent = checkpoints/mms/v004, the word model):
+python ns.py train -continue -c checkpoints/mms --data fleurs_ceb_ph -mtl 300 -d auto -e 30 --max-batch-frames 800000
+#   parent v004 weights + vocabulary are inherited, a fresh optimizer/scheduler
+#   start, and the old 318-row manifest is auto-wired as --replay-manifest +
+#   --eval-manifest (ratio 0.3) so the words are not forgotten. New versions
+#   land in checkpoints/mms as v005, v006, ... (auto-prune keeps ~4).
+#   --max-batch-frames 800000 is REQUIRED here: plain -b 8 OOMs on FLEURS
+#   (~10 min/epoch, 2.7GB peak). Add --replay-ratio 0.1 to lean less on the
+#   old word set, and/or --num-workers 2 to overlap audio decoding.
+
+# Same thing in its own line, leaving checkpoints/mms untouched (replay is NOT
+# auto-wired for --from-checkpoint, so pass it yourself):
+python ns.py train --from-checkpoint checkpoints/mms/v004 -c checkpoints/fleurs \
+    --data fleurs_ceb_ph -mtl 300 -d auto -e 30 \
+    --replay-manifest data/processed/manifest.csv --replay-ratio 0.3
 
 Handled for you automatically (no typing needed):
 - no -m  -> fb (facebook/mms-300m). Pass -m none for a from-scratch encoder.
 - no -c  -> -continue/-resume auto-detect the newest line under checkpoints/ (yours = checkpoints/mms).
 - -continue auto-wires --replay-manifest + --eval-manifest from the parent's dataset (ratio 0.3).
+- -continue/--from-checkpoint inherit the parent's trained weights and vocabulary;
+  characters the new data introduces are appended (old token ids keep their
+  trained embeddings), and the resized embedding/projection rows start fresh.
 - Stale split_*.json files are auto-detected (manifest SHA-256 fingerprint) and re-split when data changes.
+- --data fleurs_ceb_ph keeps the corpus' official partition instead of re-splitting.
 - -b defaults to 8; drop to 4-6 on the 6GB GPU if OOM. Pick -e to control run length.
 
-Always-available train flags (long form still works):
---dataset <csv> -b/--batch-size -e/--epochs -d/--device -mtl/--max-text-len
+All train flags (short form still works):
+--data <name|dir|manifest>   --dataset <csv> (legacy, mutually exclusive with --data)
+--text-field transcript|raw_transcript
+-b/--batch-size  -e/--epochs  -d/--device (auto|cuda[:N]|mps|cpu)  --learning-rate  --seed
+--optimizer AdamW|SGD  --grad-clip  --validation-frequency  --beam-size (1 = greedy)
+--split-dir  --no-fp16  --backbone-unfreeze-layers  --model-head decoder|ctc
+--model-backbone fb|mms|mms-300m|<hf id>|none  --model-d-model  --model-heads
+--model-encoder-layers  --model-decoder-layers
 --retain-every N (positive milestone interval; 0 = best-only; negative = keep all)
 --retain-protect vNNN (pin a version)
+--lr-patience  --lr-factor  --lr-threshold  --lr-cooldown  (ReduceLROnPlateau)
 --replay-manifest <csv> --replay-ratio 0.3        --eval-manifest <old-csv> (regression)
+--max-batch-frames 800000   (padded-samples cap = the real VRAM knob on long audio)
+--no-length-group           (batch at random again; costs VRAM on FLEURS)
+--num-workers 2             (prefetch/decode audio in worker processes)
 
 Short-flag map: -m model backbone (fb/mms/mms-300m = facebook/mms-300m; none = from scratch)
                  -c checkpoint dir (writable line, e.g. checkpoints/mms-sent)
                  -e epochs   -b batch size   -mtl max text len   -d device (auto|cuda|cpu)
 
 Inference:
-python ns.py transcribe <audio> --checkpoint checkpoints/mms-sent/latest --device cuda
+python ns.py transcribe <audio> --checkpoint checkpoints/mms/latest --device cuda
+python ns.py transcribe <audio> --checkpoint best --beam-size 5
+python ns.py transcribe <audio> --offline                # local HF cache only
 python ns.py mic --seconds 5                  # live mic test
 python ns.py mic --loop --seconds 3           # keep going until Ctrl+C
-python ns.py probe --checkpoint checkpoints/mms-sent/latest   # encoder-collapse check
+python ns.py mic --stream                     # continuous speech detection + transcription
+python ns.py mic --list-devices               # audio input/output devices
+python ns.py mic --tts-backend piper          # speak the result back (system|none|auto also)
+python ns.py mic --voice <name> --voice-dir voices/
+python ns.py probe --checkpoint checkpoints/mms/latest   # encoder-collapse check
+python ns.py probe --untrained --by-type      # fresh-backbone baseline, CER by word/sentence
 
 Deploy / env:
 python ns.py optimize                         # INT8 quant + ONNX export
+python ns.py optimize --checkpoint checkpoints/mms/latest --skip-onnx
+python ns.py optimize --tensorrt --tensorrt-precision int8
 python ns.py devices                          # detect compute devices
 python ns.py devices --check cuda             # resolve a device string
-uvicorn src.api.main:app --port 8000          # FastAPI
-python -m pytest tests -q                     # 107 tests
+uvicorn src.api.main:app --port 8000          # FastAPI (model loaded once at startup)
+python -m pytest tests -q                     # 138 tests, no dataset needed
 
-Sentences (this afternoon):
-1. Put sentence audio in data/raw/assets/ as <id>.opus
-2. Add lines to data/raw/index.txt:  sentence text = <id>
+Same commands without the wrapper: `python -m src.data.prepare`,
+`python -m src.data.validate`, `python -m src.data.registry` (== ns.py datasets),
+`python -m src.training.train`, `python -m src.inference.transcriber`,
+`python -m src.inference.mic`, `python -m src.inference.probe`,
+`python -m src.deploy.optimize`, `python -m src.device_info`.
+
+Word/sentence data from data/raw (the `default` dataset):
+1. Put audio in data/raw/assets/ as <id>.opus
+2. Add lines to data/raw/index.txt:  sentence text = <id>   (or a [section] header line)
 3. python ns.py prepare
 4. python ns.py validate --fail-on-error
 5. python ns.py train -new -c checkpoints/mms-sent -e 30 -b 10 -mtl 128 -d auto
@@ -80,24 +176,25 @@ Sentences (this afternoon):
    ...or later, once checkpoints/mms-sent exists, keep training it with:
    python ns.py train -continue -c checkpoints/mms-sent -e 30 -mtl 128 -d auto
 
-Flash drive sync (copy_repo.sh - two-way, skips .venv + caches, finds drive by label "KINGSTONE E"):
+Flash drive sync (copy_repo.sh - two-way, skips caches + data blobs, finds drive by label "KINGSTONE E"):
 bash copy_repo.sh                  # PUSH: repo -> D:\projects\neural-speech
-bash copy_repo.sh -r               # PULL: D:\projects\neural-speech -> PC (keeps local .venv)
+bash copy_repo.sh -r               # PULL: D:\projects\neural-speech -> PC
 bash copy_repo.sh -p myfolder     # use <flash>/myfolder instead of "projects"
 bash copy_repo.sh -d "E:\x" [-r]   # manual base dir, either direction
 bash copy_repo.sh -f               # overwrite destination if it already exists
 # bash = Git for Windows (now on PATH: add 'C:\Program Files\Git\bin' to PATH or restart the terminal)
 # Use checkpoints straight off the drive:
 #   python ns.py transcribe a.opus --checkpoint D:\projects\neural-speech\checkpoints\mms\latest
-#   python ns.py train -resume D:\projects\neural-speech\checkpoints\mms\v026 ...
+#   python ns.py train -resume D:\projects\neural-speech\checkpoints\mms\v004 ...
 
-Run on another PC (torch lives in .venv, NOT in the repo / git):
+Run on another PC (torch lives in the venv you create, NOT in the repo / git):
 0. fastest: bash copy_repo.sh  -> flash, then on the other PC:  bash copy_repo.sh -r
-   (the flash copy already excludes .venv + caches and carries the checkpoints)
-1. or copy the repo folder SKIPPING .venv/ and caches (keep checkpoints/), or git clone it
+1. or copy the repo folder SKIPPING caches (keep checkpoints/), or git clone it.
+   Note: data/ blobs and checkpoints/ are git-ignored, so clone gives you code only.
 2. cd repo && python -m venv .venv && .venv\Scripts\activate
 3. pip install -r requirements.txt            # picks CPU torch; any PC works
 4. NVIDIA GPU there? then also:
    pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cu130 torch torchaudio
-   (use cu121/cu124 etc. matching that GPU's driver) 
+   (use cu121/cu124 etc. matching that GPU's driver)
 5. copy checkpoints from the flash drive into checkpoints/ (or pass --checkpoint/-c D:\... paths directly)
+6. re-create the dataset blobs: data/raw/assets (or run the FLEURS export) - they are git-ignored

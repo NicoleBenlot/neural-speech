@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
 import random
@@ -17,6 +18,8 @@ from torch.utils.data import DataLoader
 
 from src.data.dataset import (
     Batch,
+    LengthGroupedBatchSampler,
+    ManifestRow,
     SpeechDataset,
     collate_speech,
     load_split,
@@ -29,6 +32,7 @@ from src.data.dataset import (
     _rows_to_dataset,
 )
 from src.data.prepare import write_manifest
+from src.data.registry import resolve_dataset
 from src.device_info import auto_device, resolve_device, summarize
 from src.models.stt import STTConfig, STTModel, build_stt_model
 from src.tokens.tokenizer import BLANK, CharTokenizer
@@ -44,6 +48,19 @@ _BACKBONE_ALIASES = {
     "mms-300m": "facebook/mms-300m",
 }
 
+# torch >=2.14 reports device OOM as AcceleratorError; OutOfMemoryError is a
+# sibling, not a subclass, and older builds only raise the plain RuntimeError.
+OOM_ERRORS: tuple = tuple(
+    {
+        exc
+        for exc in (
+            getattr(torch, "OutOfMemoryError", None),
+            getattr(torch, "AcceleratorError", None),
+        )
+        if isinstance(exc, type) and issubclass(exc, BaseException)
+    }
+) or (RuntimeError,)
+
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -56,6 +73,9 @@ def set_seed(seed: int):
 @dataclass
 class TrainConfig:
     batch_size: int = 8
+    length_group: bool = True
+    max_batch_frames: int = 0
+    num_workers: int = 0
     learning_rate: float = 1e-3
     epochs: int = 30
     optimizer: str = "AdamW"
@@ -64,6 +84,10 @@ class TrainConfig:
     seed: int = 42
     checkpoint_dir: str = "checkpoints"
     dataset: str = "data/processed/manifest.csv"
+    data: Optional[str] = None
+    data_name: Optional[str] = None
+    text_field: str = "transcript"
+    preset_splits: Optional[Dict[str, List[ManifestRow]]] = None
     validation_frequency: int = 1
     replay_ratio: float = 0.0
     replay_manifest: Optional[str] = None
@@ -126,6 +150,7 @@ class Trainer:
         self.state = TrainingState()
         self.global_step = 0
         self.last_saved = False
+        self.parent_model_sd: Optional[Dict[str, torch.Tensor]] = None
 
     def _validate_training_args(self):
         if self.config.resume and self.config.from_checkpoint:
@@ -142,17 +167,86 @@ class Trainer:
             )
 
     def _prepare_epoch_from_checkpoint(self):
-        """For incremental training, build tokenizer/vocab from the parent vocab plus new data."""
-        self.manager.load(self.config.from_checkpoint)
+        """Incremental run: inherit the parent's weights, arch, and vocabulary.
+
+        The parent's ``model_sd`` is stashed and applied in
+        :meth:`_build_model_and_optimizer` — after the tokenizer has been extended
+        with the new data's characters — so the vocabulary-sized tensors can be
+        resized instead of silently resetting to a fresh random model.
+        """
         data = self.manager.load(self.config.from_checkpoint)
-        parent_tokenizer = data["tokenizer"]
-        self.tokenizer = parent_tokenizer
-        parent_config = data["config"]
-        self.config.model = parent_config
+        self.tokenizer = data["tokenizer"]
+        self.config.model = data["config"]
         self.state.parent_checkpoint = self.config.from_checkpoint
+        self.parent_model_sd = data["model_sd"]
 
         parent_state = data["state"]
         self.state.dataset_version = parent_state.dataset_version
+
+    def _load_parent_weights(self):
+        """Restore the parent's tensors onto the freshly built model.
+
+        Layers whose shape changed with a grown vocabulary (token embedding,
+        output projection) are dropped and keep their fresh initialization;
+        everything else - including the fine-tuned backbone - is restored.
+        """
+        own = self.model.state_dict()
+        usable = {}
+        skipped = []
+        for key, value in self.parent_model_sd.items():
+            current = own.get(key)
+            if current is None or current.shape != value.shape:
+                skipped.append(key)
+            else:
+                usable[key] = value
+        self.model.load_state_dict(usable, strict=False)
+        logger.info(
+            "Continued from %s: restored %d parent tensors",
+            self.config.from_checkpoint,
+            len(usable),
+        )
+        if skipped:
+            logger.info(
+                "Kept fresh init for %d resized tensor(s) (vocabulary grew): %s",
+                len(skipped),
+                ", ".join(skipped),
+            )
+
+    def _partition_rows(
+        self, rows: List[ManifestRow]
+    ) -> tuple[List[ManifestRow], List[ManifestRow], List[ManifestRow]]:
+        """Use the dataset's official partition when it ships one, else split randomly.
+
+        A preset split (e.g. FLEURS train/validation/test) is reproduced as-is so
+        numbers stay comparable with the corpus' published results; everything
+        else keeps the historical seeded 80/10/10 cut.
+        """
+        preset = self.config.preset_splits
+        if preset:
+            logger.info(
+                "Using preset splits from dataset %r: %s",
+                self.config.data_name,
+                ", ".join(f"{k}={len(v)}" for k, v in preset.items()),
+            )
+            return (
+                list(preset.get("train", [])),
+                list(preset.get("valid", [])),
+                list(preset.get("test", [])),
+            )
+        return split_dataset(rows, seed=self.config.seed)
+
+    def _datasets_from_rows(
+        self,
+        train_rows: List[ManifestRow],
+        valid_rows: List[ManifestRow],
+        test_rows: List[ManifestRow],
+    ) -> tuple[SpeechDataset, SpeechDataset, SpeechDataset]:
+        def to_dataset(rows: List[ManifestRow]) -> SpeechDataset:
+            return _rows_to_dataset(
+                [r.__dict__ for r in rows], self.tokenizer, self.config.sample_rate
+            )
+
+        return to_dataset(train_rows), to_dataset(valid_rows), to_dataset(test_rows)
 
     def _load_datasets(
         self,
@@ -175,20 +269,33 @@ class Trainer:
             self.tokenizer.build_from_texts([r.text for r in rows])
             if self.config.model.head == "ctc":
                 self.tokenizer.add_blank()
-            train_rows, valid_rows, test_rows = split_dataset(
-                rows, seed=self.config.seed
-            )
+            train_rows, valid_rows, test_rows = self._partition_rows(rows)
             save_split(
                 split_file, train_rows, valid_rows, test_rows,
                 self.config.seed, fingerprint=current_fp,
             )
-            train_ds = _rows_to_dataset([r.__dict__ for r in train_rows], self.tokenizer, self.config.sample_rate)
-            valid_ds = _rows_to_dataset([r.__dict__ for r in valid_rows], self.tokenizer, self.config.sample_rate)
-            test_ds = _rows_to_dataset([r.__dict__ for r in test_rows], self.tokenizer, self.config.sample_rate)
+            train_ds, valid_ds, test_ds = self._datasets_from_rows(
+                train_rows, valid_rows, test_rows
+            )
         else:
             if self.tokenizer is None:
                 ckpt = self.config.resume or self.config.from_checkpoint
                 self.tokenizer = self.manager.load(ckpt)["tokenizer"]
+
+            if self.config.from_checkpoint:
+                # Incremental: keep every parent token id (they carry trained
+                # embeddings) and append the characters the new data introduces.
+                # --resume deliberately skips this - its data is unchanged and
+                # its model was already restored at the parent's vocabulary.
+                before = self.tokenizer.vocab_size()
+                self.tokenizer.build_from_texts([r.text for r in rows])
+                added = self.tokenizer.vocab_size() - before
+                logger.info(
+                    "Incremental vocabulary: %d -> %d token(s) (%d added for the new data)",
+                    before,
+                    self.tokenizer.vocab_size(),
+                    added,
+                )
 
             reused = False
             if split_file.exists():
@@ -210,16 +317,14 @@ class Trainer:
                     )
 
             if not reused:
-                train_rows, valid_rows, test_rows = split_dataset(
-                    rows, seed=self.config.seed
-                )
+                train_rows, valid_rows, test_rows = self._partition_rows(rows)
                 save_split(
                     split_file, train_rows, valid_rows, test_rows,
                     self.config.seed, fingerprint=current_fp,
                 )
-                train_ds = _rows_to_dataset([r.__dict__ for r in train_rows], self.tokenizer, self.config.sample_rate)
-                valid_ds = _rows_to_dataset([r.__dict__ for r in valid_rows], self.tokenizer, self.config.sample_rate)
-                test_ds = _rows_to_dataset([r.__dict__ for r in test_rows], self.tokenizer, self.config.sample_rate)
+                train_ds, valid_ds, test_ds = self._datasets_from_rows(
+                    train_rows, valid_rows, test_rows
+                )
 
         replay_ds = None
         if self.config.replay_manifest and self.config.replay_ratio > 0:
@@ -232,6 +337,32 @@ class Trainer:
 
         return train_ds, valid_ds, test_ds, replay_ds
 
+    def _warn_decode_budget(self, dataset: SpeechDataset, sample: int = 500):
+        """Warn when transcripts are longer than the decoding cap.
+
+        Training pads to the batch maximum, but eval decoding stops at
+        ``--max-text-len``; on long-sentence corpora (FLEURS medians sit well
+        above 100 characters) the default 64 would silently truncate every
+        hypothesis and inflate CER.
+        """
+        rows = dataset.rows[:sample]
+        if not rows:
+            return
+        lengths = sorted(len(self.tokenizer.encode(r.text)) for r in rows)
+        p90 = lengths[int(len(lengths) * 0.9) - 1]
+        over = sum(1 for length in lengths if length > self.config.max_text_len)
+        if over:
+            logger.warning(
+                "%d/%d sampled train transcripts exceed --max-text-len %d "
+                "(p90=%d chars incl. BOS/EOS): eval decoding will truncate them "
+                "and inflate CER - pass -mtl %d",
+                over,
+                len(lengths),
+                self.config.max_text_len,
+                p90,
+                max(p90, self.config.max_text_len),
+            )
+
     def _build_model_and_optimizer(self):
         if self.model is None:
             if self.config.model.head == "ctc" and self.config.model.blank_token_id is None:
@@ -240,7 +371,18 @@ class Trainer:
                     raise RuntimeError("CTC training requires a blank token in the tokenizer")
                 self.config.model.blank_token_id = blank_id
             self.model = build_stt_model(self.config.model, self.tokenizer.vocab_size())
+            if self.parent_model_sd is not None:
+                self._load_parent_weights()
             self.model.to(self.device)
+
+        # AMP lives with the model, so a caller that drives _train_epoch
+        # directly (tests, tooling) gets the same numerics as train().
+        self.use_amp = self.config.mixed_precision and self.device.type == "cuda"
+        self.scaler = (
+            torch.amp.GradScaler("cuda", enabled=self.use_amp)
+            if self.use_amp
+            else None
+        )
 
         if self.optimizer is None:
             opt_name = self.config.optimizer.lower()
@@ -322,6 +464,38 @@ class Trainer:
             if "numpy" in rng:
                 np.random.set_state(rng["numpy"])
 
+    def _build_loader(self, dataset: SpeechDataset, shuffle: bool) -> DataLoader:
+        """One loader, streaming: audio is decoded per item and dropped again.
+
+        With ``--length-group`` (default) the batches are cut by duration
+        instead of at random, so a batch is padded to roughly its own longest
+        clip rather than to the longest clip in the epoch. On a 6 GB card that
+        is the difference between training on 13s FLEURS sentences and
+        immediately running out of memory on a 40s one.
+        """
+        if not self.config.length_group or not isinstance(dataset, SpeechDataset):
+            return DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                shuffle=shuffle,
+                collate_fn=collate_speech,
+                num_workers=self.config.num_workers,
+            )
+
+        sampler = LengthGroupedBatchSampler(
+            dataset.num_samples(),
+            batch_size=self.config.batch_size,
+            seed=self.config.seed,
+            max_frames=self.config.max_batch_frames,
+            shuffle=shuffle,
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            collate_fn=collate_speech,
+            num_workers=self.config.num_workers,
+        )
+
     def train(self):
         self._validate_training_args()
 
@@ -337,50 +511,21 @@ class Trainer:
         logger.info("Train samples: %d", len(train_ds))
         logger.info("Validation samples: %d", len(valid_ds))
         logger.info("Test samples: %d", len(test_ds))
+        self._warn_decode_budget(train_ds)
 
         self._build_model_and_optimizer()
 
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            collate_fn=collate_speech,
-            num_workers=0,
-        )
-        valid_loader = DataLoader(
-            valid_ds,
-            batch_size=self.config.batch_size,
-            shuffle=False,
-            collate_fn=collate_speech,
-            num_workers=0,
-        )
+        train_loader = self._build_loader(train_ds, shuffle=True)
+        valid_loader = self._build_loader(valid_ds, shuffle=False)
         typed_valid_loaders = self._build_typed_validation_loaders(valid_ds)
-        test_loader = DataLoader(
-            test_ds,
-            batch_size=self.config.batch_size,
-            shuffle=False,
-            collate_fn=collate_speech,
-            num_workers=0,
-        )
+        test_loader = self._build_loader(test_ds, shuffle=False)
 
         if replay_ds is not None:
             logger.info("Replay samples: %d", len(replay_ds))
-            replay_loader = DataLoader(
-                replay_ds,
-                batch_size=self.config.batch_size,
-                shuffle=True,
-                collate_fn=collate_speech,
-                num_workers=0,
-            )
+            replay_loader = self._build_loader(replay_ds, shuffle=True)
         else:
             replay_loader = None
 
-        self.use_amp = self.config.mixed_precision and self.device.type == "cuda"
-        self.scaler = (
-            torch.amp.GradScaler("cuda", enabled=self.use_amp)
-            if self.use_amp
-            else None
-        )
         logger.info(
             "Using device: %s (AMP=%s); auto would select %s",
             self.device,
@@ -477,6 +622,7 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         n_batches = 0
+        skipped = 0
         all_preds: List[str] = []
         all_refs: List[str] = []
 
@@ -502,17 +648,35 @@ class Trainer:
 
             self.optimizer.zero_grad()
 
-            with torch.autocast(
-                device_type=self.device.type, enabled=self.use_amp
-            ):
-                loss = self._batch_loss(
-                    audio, audio_lengths, tokens, token_lengths
-                )
+            try:
+                with torch.autocast(
+                    device_type=self.device.type, enabled=self.use_amp
+                ):
+                    loss = self._batch_loss(
+                        audio, audio_lengths, tokens, token_lengths
+                    )
 
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            except OOM_ERRORS as exc:
+                # A long clip can still spike past what the card can hold;
+                # drop this batch rather than losing a multi-hour run.
+                self.optimizer.zero_grad(set_to_none=True)
+                del audio, audio_lengths, tokens, token_lengths
+                self._free_memory()
+                skipped += 1
+                logger.warning(
+                    "Out of memory on batch %d (epoch %d, %d clips, longest %d samples); "
+                    "skipping it - lower -b or --max-batch-frames (%s)",
+                    batch_num + 1,
+                    epoch + 1,
+                    len(batch.audio_lengths),
+                    int(batch.audio_lengths.max()),
+                    type(exc).__name__,
+                )
+                continue
 
             if self.config.grad_clip > 0:
                 if self.scaler is not None:
@@ -563,7 +727,19 @@ class Trainer:
 
         avg_loss = total_loss / max(n_batches, 1)
         metrics = compute_metrics(all_refs, all_preds)
+        if skipped:
+            logger.warning(
+                "epoch %d finished with %d batch(es) skipped after CUDA OOM",
+                epoch + 1,
+                skipped,
+            )
         return avg_loss, metrics.cer, metrics.wer
+
+    def _free_memory(self):
+        """Release cached CUDA blocks so the next batch starts from clean VRAM."""
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def _batch_loss(
         self,
@@ -829,8 +1005,55 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Incremental: load weights/vocab/arch from an existing checkpoint, "
         "start a fresh optimizer and record parent_checkpoint.",
     )
-    parser.add_argument("--dataset", default="data/processed/manifest.csv")
+    data_group = parser.add_mutually_exclusive_group()
+    data_group.add_argument(
+        "--data",
+        default=None,
+        metavar="NAME_OR_PATH",
+        help="Named dataset or path. 'default' = data/processed/manifest.csv "
+        "(random 80/10/10 split); 'fleurs_ceb_ph' = data/fleurs_ceb_ph with its "
+        "official train/validation/test splits; a dataset directory or manifest "
+        "CSV/TSV path also works. Run `ns.py datasets` for the registry. "
+        "Mutually exclusive with --dataset.",
+    )
+    data_group.add_argument(
+        "--dataset",
+        default="data/processed/manifest.csv",
+        help="Manifest CSV path (legacy; use --data for named datasets)",
+    )
+    parser.add_argument(
+        "--text-field",
+        default="transcript",
+        choices=["transcript", "raw_transcript"],
+        help="Which column of a multi-column export becomes the target text. "
+        "Default 'transcript' (the normalized column).",
+    )
     parser.add_argument("-b", "--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--no-length-group",
+        dest="length_group",
+        action="store_false",
+        help="Disable duration-bucketed batches (default: group clips of similar "
+             "length together so padding, and VRAM, stay small).",
+    )
+    parser.add_argument(
+        "--max-batch-frames",
+        type=int,
+        default=0,
+        help="Cap padded samples per batch (len(batch) * longest clip), the "
+             "direct bound on activation memory. 0 = only -b applies. Units are "
+             "16 kHz samples: 400000 = 25s of audio per batch, e.g. two 13s "
+             "FLEURS sentences or eight 3s clips. Measured on a 6GB RTX 3050 "
+             "(MMS-300m, last 4 layers unfrozen): 166k -> 2.4GB peak, 400k -> "
+             "4.1GB, 800k -> 5.2GB, 1.3M -> 7.2GB (oversubscribed).",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader worker processes for audio decoding. 0 keeps only the "
+             "current batch in memory; >0 prefetches that many times per worker.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("-e", "--epochs", type=int, default=30)
     parser.add_argument("--optimizer", default="AdamW", choices=["AdamW", "SGD"])
@@ -974,6 +1197,39 @@ def _best_version_dir(manager: CheckpointManager) -> Path:
     return manager.version_dir(best)
 
 
+def _apply_data_defaults(config: TrainConfig) -> TrainConfig:
+    """Resolve ``--data`` into a manifest path (and preset splits, if any).
+
+    Runs before ``_apply_mode_defaults`` so ``-continue`` compares the parent's
+    manifest against the *resolved* dataset and can still wire the parent data
+    in as replay/regression reference.
+    """
+    if not config.data:
+        return config
+
+    spec = resolve_dataset(config.data)
+    missing = spec.missing_sources()
+    if missing:
+        hint = spec.prepare_hint or "export the dataset first"
+        raise FileNotFoundError(
+            f"Dataset {spec.name!r} is incomplete; missing: {', '.join(missing)}. "
+            f"Hint: {hint}"
+        )
+
+    config.dataset = str(spec.manifest)
+    config.data_name = spec.name
+    if spec.has_preset_splits:
+        config.preset_splits = spec.read_splits(text_field=config.text_field)
+
+    logger.info(
+        "--data %s -> %s (manifest: %s)",
+        config.data,
+        spec.name,
+        config.dataset,
+    )
+    return config
+
+
 def _apply_mode_defaults(config: TrainConfig) -> TrainConfig:
     """Resolve the abbreviated mode flags into concrete targets.
 
@@ -1045,6 +1301,9 @@ def main():
     )
     config = TrainConfig(
         batch_size=args.batch_size,
+    length_group=args.length_group,
+    max_batch_frames=args.max_batch_frames,
+    num_workers=args.num_workers,
         learning_rate=args.learning_rate,
         epochs=args.epochs,
         optimizer=args.optimizer,
@@ -1053,6 +1312,8 @@ def main():
         seed=args.seed,
         checkpoint_dir=args.checkpoint_dir,
         dataset=args.dataset,
+        data=args.data,
+        text_field=args.text_field,
         validation_frequency=args.validation_frequency,
         replay_ratio=args.replay_ratio,
         replay_manifest=args.replay_manifest,
@@ -1074,6 +1335,7 @@ def main():
         model=model_config,
     )
 
+    config = _apply_data_defaults(config)
     config = _apply_mode_defaults(config)
     if config.checkpoint_dir is None:
         config.checkpoint_dir = "checkpoints"
