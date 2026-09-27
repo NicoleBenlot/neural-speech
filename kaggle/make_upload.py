@@ -59,6 +59,11 @@ CODE_EXCLUDE_DIRS = {
 }
 DATA_AUDIO_DIRS = ("data/fleurs_ceb_ph", "data/raw")
 AUDIO_SUFFIXES = {".wav", ".opus", ".flac", ".ogg", ".mp3", ".m4a"}
+# Sidecars that must ride along with the audio: the per-split FLEURS
+# ``manifest.tsv`` (DatasetSpec.missing_sources requires it, even when the
+# combined manifest CSV is present) and ``data/raw/index.txt``. Both store bare
+# filenames / slash-free paths, so they need no rewrite.
+DATA_SIDECAR_SUFFIXES = {".tsv", ".txt"}
 CKPT_INDEXES = ("latest.json", "best.json", "protect.json")
 
 
@@ -164,7 +169,10 @@ def build_data_zip(out: Path, include_audio: bool) -> Tuple[Path, int]:
                     print(f"  ! missing {rel}, skipped (re-create the export)")
                     continue
                 for path in sorted(root.rglob("*")):
-                    if not path.is_file() or path.suffix.lower() not in AUDIO_SUFFIXES:
+                    if not path.is_file():
+                        continue
+                    suffix = path.suffix.lower()
+                    if suffix not in AUDIO_SUFFIXES | DATA_SIDECAR_SUFFIXES:
                         continue
                     zf.write(path, path.relative_to(REPO).as_posix())
                     files += 1
