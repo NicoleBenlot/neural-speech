@@ -464,7 +464,12 @@ class Trainer:
             if "numpy" in rng:
                 np.random.set_state(rng["numpy"])
 
-    def _build_loader(self, dataset: SpeechDataset, shuffle: bool) -> DataLoader:
+    def _build_loader(
+        self,
+        dataset: SpeechDataset,
+        shuffle: bool,
+        num_workers: Optional[int] = None,
+    ) -> DataLoader:
         """One loader, streaming: audio is decoded per item and dropped again.
 
         With ``--length-group`` (default) the batches are cut by duration
@@ -472,14 +477,20 @@ class Trainer:
         clip rather than to the longest clip in the epoch. On a 6 GB card that
         is the difference between training on 13s FLEURS sentences and
         immediately running out of memory on a 40s one.
+
+        The frame cap applies to *every* loader, validation included: an
+        uncapped eval batch padded to the longest clip in a window is the same
+        memory spike as an uncapped training batch, and the peak lands after
+        the training allocator has already cached a full epoch's blocks.
         """
+        workers = self.config.num_workers if num_workers is None else num_workers
         if not self.config.length_group or not isinstance(dataset, SpeechDataset):
             return DataLoader(
                 dataset,
                 batch_size=self.config.batch_size,
                 shuffle=shuffle,
                 collate_fn=collate_speech,
-                num_workers=self.config.num_workers,
+                num_workers=workers,
             )
 
         sampler = LengthGroupedBatchSampler(
@@ -493,7 +504,7 @@ class Trainer:
             dataset,
             batch_sampler=sampler,
             collate_fn=collate_speech,
-            num_workers=self.config.num_workers,
+            num_workers=workers,
         )
 
     def train(self):
@@ -546,6 +557,10 @@ class Trainer:
             val_cer = 0.0
             val_wer = 0.0
             if should_val:
+                # Hand the training pass's cached blocks back before the eval
+                # peak, otherwise the allocator holds a full epoch's worth and
+                # the first validation batch has nothing left to grow into.
+                self._free_memory()
                 val_loss, val_cer, val_wer = self._evaluate(valid_loader)
                 validation_by_type = self._evaluate_by_type(typed_valid_loaders)
                 self.scheduler.step(val_loss)
@@ -828,29 +843,49 @@ class Trainer:
         return nn.functional.cross_entropy(logits, masked_target, ignore_index=-100)
 
     def _evaluate(
-        self, loader: DataLoader
+        self, loader: DataLoader, label: str = "validation"
     ) -> tuple[float, float, float]:
         self.model.eval()
         total_loss = 0.0
         n_batches = 0
+        skipped = 0
         all_preds: List[str] = []
         all_refs: List[str] = []
 
         with torch.no_grad():
-            for batch in loader:
+            for batch_num, batch in enumerate(loader):
                 audio = batch.audio.to(self.device)
                 audio_lengths = batch.audio_lengths.to(self.device)
                 tokens = batch.tokens.to(self.device)
                 token_lengths = batch.token_lengths.to(self.device)
 
-                with torch.autocast(
-                    device_type=self.device.type, enabled=self.use_amp
-                ):
-                    loss = self._batch_loss(
-                        audio, audio_lengths, tokens, token_lengths
+                try:
+                    with torch.autocast(
+                        device_type=self.device.type, enabled=self.use_amp
+                    ):
+                        loss = self._batch_loss(
+                            audio, audio_lengths, tokens, token_lengths
+                        )
+                    total_loss += loss.item()
+                    n_batches += 1
+                except OOM_ERRORS as exc:
+                    # Never let one oversized eval batch discard a completed
+                    # epoch: the weights are already trained, only the metrics
+                    # for this window are lost.
+                    del audio, audio_lengths, tokens, token_lengths
+                    self._free_memory()
+                    skipped += 1
+                    logger.warning(
+                        "Out of memory during %s batch %d (%d clips, longest %d "
+                        "samples); skipping it - lower -b or "
+                        "--max-batch-frames (%s)",
+                        label,
+                        batch_num + 1,
+                        len(batch.audio_lengths),
+                        int(batch.audio_lengths.max()),
+                        type(exc).__name__,
                     )
-                total_loss += loss.item()
-                n_batches += 1
+                    continue
 
                 hyp_ids = self.model.decode(
                     audio,
@@ -864,6 +899,15 @@ class Trainer:
                     all_preds.append(self.tokenizer.decode(h))
                     all_refs.append(ref)
 
+        if skipped:
+            logger.warning(
+                "%s: skipped %d of %d batch(es) after OOM - CER/WER below cover "
+                "the remaining %d sample(s) only",
+                label,
+                skipped,
+                skipped + n_batches,
+                len(all_refs),
+            )
         metrics = compute_metrics(all_refs, all_preds)
         avg_loss = total_loss / max(n_batches, 1)
         return avg_loss, metrics.cer, metrics.wer
@@ -871,7 +915,14 @@ class Trainer:
     def _build_typed_validation_loaders(
         self, valid_ds: SpeechDataset
     ) -> Dict[str, DataLoader]:
-        """Build automatic word/sentence validation views from transcript text."""
+        """Build automatic word/sentence validation views from transcript text.
+
+        These go through ``_build_loader`` so they inherit the same frame cap
+        as training. Built by hand they were the worst batch in the run: FLEURS
+        validation has no single-word clips at all, so the whole split lands in
+        the "sentence" view, and an uncapped ``batch_size`` x longest-clip
+        window reached 5.3M padded samples against a 800k training cap.
+        """
         typed: Dict[str, DataLoader] = {}
         for sample_type in ("word", "sentence"):
             rows = [
@@ -885,12 +936,8 @@ class Trainer:
                 self.tokenizer,
                 self.config.sample_rate,
             )
-            typed[sample_type] = DataLoader(
-                dataset,
-                batch_size=self.config.batch_size,
-                shuffle=False,
-                collate_fn=collate_speech,
-                num_workers=0,
+            typed[sample_type] = self._build_loader(
+                dataset, shuffle=False, num_workers=0
             )
             logger.info("%s validation samples: %d", sample_type, len(dataset))
         return typed
@@ -900,7 +947,9 @@ class Trainer:
     ) -> Dict[str, Dict[str, float]]:
         results: Dict[str, Dict[str, float]] = {}
         for sample_type, loader in loaders.items():
-            loss, sample_cer, sample_wer = self._evaluate(loader)
+            loss, sample_cer, sample_wer = self._evaluate(
+                loader, label=f"{sample_type} validation"
+            )
             results[sample_type] = {
                 "loss": loss,
                 "cer": sample_cer,

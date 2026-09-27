@@ -18,6 +18,7 @@ from src.training.checkpoint import CheckpointManager
 from src.models.stt import STTConfig
 from src.data.dataset import (
     LengthGroupedBatchSampler,
+    _rows_to_dataset,
     manifest_fingerprint,
     read_manifest,
     split_fingerprint,
@@ -407,4 +408,107 @@ def test_training_skips_batch_after_oom(base_config, monkeypatch):
     loss, _, _ = trainer._train_epoch(loader, None, 0)
     assert calls["n"] > 1  # the run continued past the failed batch
     assert loss > 0
+
+
+def _typed_validation_dataset(trainer, tmp_path):
+    """A validation set with both single-word and multi-word rows.
+
+    Built explicitly rather than via the 80/10/10 split, because the typed
+    views key off the transcript and a random split can leave either one empty.
+    FLEURS validation in production is the reverse: zero single-word rows, so
+    the entire split lands in the "sentence" view.
+    """
+    import math
+    import wave
+
+    assets = tmp_path / "typed_assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for i, text in enumerate(["adlaw", "ako", "adlaw ako", "adlaw ako bat"]):
+        path = assets / f"{i}.wav"
+        with wave.open(str(path), "wb") as fh:
+            fh.setnchannels(1)
+            fh.setsampwidth(2)
+            fh.setframerate(16000)
+            frames = b"".join(
+                int(3000 * math.sin(i * t / 40)).to_bytes(2, "little", signed=True)
+                for t in range(4800)
+            )
+            fh.writeframes(frames)
+        rows.append({"id": i, "audio_path": str(path), "text": text, "section": "valid"})
+    return _rows_to_dataset(rows, trainer.tokenizer, 16000)
+
+
+def test_typed_validation_loaders_respect_the_frame_cap(base_config, tmp_path):
+    """Word/sentence eval views must be capped like the training loader.
+
+    FLEURS validation has no single-word clips, so the whole split lands in the
+    "sentence" view. Built by hand (plain DataLoader) its worst window reached
+    5.3M padded samples against an 800k training cap, and the OOM landed in the
+    first validation batch - after the whole epoch was already trained.
+    """
+    trainer = Trainer(
+        TrainConfig(**dict(base_config, epochs=1, max_batch_frames=4800))
+    )
+    trainer._load_datasets()  # builds the tokenizer
+    valid_ds = _typed_validation_dataset(trainer, tmp_path)
+
+    typed = trainer._build_typed_validation_loaders(valid_ds)
+
+    assert set(typed) == {"word", "sentence"}
+    for sample_type, loader in typed.items():
+        assert isinstance(
+            loader.batch_sampler, LengthGroupedBatchSampler
+        ), f"{sample_type} validation loader is not length grouped"
+        assert loader.batch_sampler.max_frames == 4800
+        assert loader.num_workers == 0
+        for batch in loader:
+            padded = batch.audio.shape[0] * batch.audio.shape[2]
+            assert padded <= 4800 or batch.audio.shape[0] == 1
+
+
+def test_typed_validation_loaders_are_capped_even_with_length_group_off(
+    base_config, tmp_path
+):
+    """--no-length-group must not silently uncap evaluation either."""
+    trainer = Trainer(
+        TrainConfig(**dict(base_config, epochs=1, length_group=False))
+    )
+    trainer._load_datasets()
+    valid_ds = _typed_validation_dataset(trainer, tmp_path)
+
+    typed = trainer._build_typed_validation_loaders(valid_ds)
+
+    for sample_type, loader in typed.items():
+        assert loader.num_workers == 0
+        assert not isinstance(
+            loader.batch_sampler, LengthGroupedBatchSampler
+        )  # plain loader, as requested
+        assert loader.batch_size == 2
+
+
+def test_evaluation_skips_batch_after_oom(base_config, tmp_path, monkeypatch):
+    """A device OOM in validation drops one batch instead of killing the run."""
+    trainer = Trainer(TrainConfig(**dict(base_config, epochs=1)))
+    trainer._load_datasets()
+    valid_ds = _typed_validation_dataset(trainer, tmp_path)
+    trainer._build_model_and_optimizer()
+
+    original = trainer._batch_loss
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate ...")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "_batch_loss", flaky)
+    loader = trainer._build_loader(valid_ds, shuffle=False)
+
+    loss, cer, _ = trainer._evaluate(loader)
+
+    assert calls["n"] > 1  # the evaluation continued past the failed batch
+    assert loss > 0
+    assert cer >= 0.0
 
