@@ -21,14 +21,21 @@ split is silently rebuilt with different rows.
 The per-split `manifest.tsv` files need no rewrite: their `filename` column is a
 bare `00000.wav` that the registry joins to the split directory at read time.
 
+**Where the run stands:** `checkpoints/mms` holds only `v004` — a 26-token
+word-corpus model. No FLEURS epoch has ever been written, so the first Kaggle
+run must use `-continue`, not `--resume` (see 3c).
+
 ## 1. Build the bundles (on Windows)
 
-Wait until the background run reports a saved version, then bundle that one
-version (each is ~1.55 GB; never upload the whole line):
+Bundle the newest version that actually exists on disk (each is ~1.55 GB; never
+upload the whole line). Right now that is **v004** — the word-corpus model:
 
 ```powershell
 python kaggle/make_upload.py --version v004
 ```
+
+If a local or previous Kaggle run wrote a FLEURS version (`v005`+), bundle that
+one instead and use `--resume` in step 3c.
 
 Output in `kaggle/dist/`, each verified to be free of backslashes:
 
@@ -82,20 +89,48 @@ Keep the downloaded backbone outside `/kaggle/working` churn, and set
 ```
 
 ```python
-# --- 3c. resume the run on the GPU ----------------------------------------
-# --resume keeps optimizer/scheduler/epoch/RNG; -continue would reset them.
-# Re-declare replay/eval explicitly: -resume does not auto-wire them.
+# --- 3c. continue onto FLEURS on the GPU ----------------------------------
+# -continue (NOT --resume) - see the warning below.
 !cd /kaggle/working/repo && CUDA_VISIBLE_DEVICES=0 python ns.py train \
-    --resume checkpoints/mms/v004 \
-    -c checkpoints/mms \
+    -continue -c checkpoints/mms \
     --data fleurs_ceb_ph \
-    --replay-manifest data/processed/manifest.csv --replay-ratio 0.3 \
     -mtl 300 -d cuda:0 -e 30 \
     --max-batch-frames 1600000 --num-workers 2
 ```
 
 `-mtl 300` is mandatory: the default 64 truncates 98% of FLEURS hypotheses and
 inflates CER.
+
+### Use `-continue`, not `--resume`, until a v005 exists
+
+`v004` is a **word-corpus** model: 26 tokens, `manifest.csv`. FLEURS needs 81.
+Vocabulary growth happens *only* on the `--from-checkpoint` path
+(`_load_datasets`), never on `--resume` — resume assumes its data is unchanged
+and its model was already restored at the parent's vocabulary.
+
+| command | tokenizer | outcome |
+| --- | --- | --- |
+| `-continue -c checkpoints/mms` | 26 → 81 (55 added) | correct — restores 421 parent tensors, fresh-init only the 2 resized CTC head tensors |
+| `--resume checkpoints/mms/v004` | stays 26 | **silently broken** — 55 characters become UNK |
+
+So the rule is: bundle the newest version you actually have, and
+- no FLEURS version written yet → `-continue`
+- resuming a run that already trained on FLEURS (`v005`+) → `--resume checkpoints/mms/vNNN`
+
+`-continue` also auto-wires replay and regression from the parent's stored
+dataset (`data/processed/manifest.csv`, ratio 0.3), because that file ships in
+`data.zip`. Expect this line at startup:
+
+```
+-continue: parent data data\processed\manifest.csv reused for replay (ratio 0.30) and regression eval
+Incremental vocabulary: 26 -> 81 token(s) (55 added for the new data)
+```
+
+If you see `parent dataset ... not found; skipping replay/regression`, the word
+manifest is missing from the bundle — re-run the bundler without `--no-audio`.
+
+`-continue` intentionally starts a **fresh** optimizer and scheduler (it is a new
+dataset, not a pause). The LR schedule restarts from the configured warmup.
 
 ## 4. Frame budget
 
@@ -104,6 +139,16 @@ on a 6 GB RTX 3050: 400k → 2.1 GB / 12.5 min per epoch, 800k → 2.7 GB / 9.9 
 (fastest), 1.6M → 3.7 GB / 15 min, 6M → OOM. A 16 GB T4 has room for more, but
 that is untested — **start at 1.6M** and raise it if a run logs no OOM skips. A
 batch that OOMs is logged and skipped, so the run survives but loses rows.
+
+The cap applies to **validation too**, not just training. This matters: FLEURS
+validation has no single-word clips, so all 225 rows land in the "sentence" view,
+and an uncapped window there reached 4.65M padded samples against an 800k
+training cap — enough to OOM *after* a finished epoch. If you raise the budget,
+watch the `sentence validation` line as well as the training batches.
+
+RAM is not a concern: the loader is lazy, a run sits at ~260 MB plus the ~1.6 GB
+transient of writing a checkpoint, against ~13 GB on Kaggle. The real ceilings
+are the 30 GPU-hours/week quota and the ~12 h session cap.
 
 ## 5. Get the checkpoints back
 

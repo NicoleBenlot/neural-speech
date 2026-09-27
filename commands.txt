@@ -200,6 +200,8 @@ Run on another PC (torch lives in the venv you create, NOT in the repo / git):
 6. re-create the dataset blobs: data/raw/assets (or run the FLEURS export) - they are git-ignored
 
 Train on Kaggle instead (Linux box; the port is isolated from the local pipeline):
-   kaggle\README.md                          # full runbook: build, upload, resume, download
+   kaggle\README.md                          # full runbook: build, upload, run, download
    python kaggle/make_upload.py --version v004   # -> kaggle/dist/{code,data,ckpt}.zip
    kaggle\make_upload.py --no-audio --version v004   # fast dry run (rewrites + verify only)
+   # first Kaggle run: -continue (not --resume) - v004 is a 26-token word model, FLEURS needs 81
+   # later runs:        --resume checkpoints/mms/vNNN (carries optimizer/scheduler/epoch/RNG)

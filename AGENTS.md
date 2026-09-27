@@ -159,9 +159,11 @@ artifacts that store paths (`data/processed/manifest*.csv` `audio`,
 fingerprint are copied byte-for-byte, so a split is never silently rebuilt with
 different rows. The per-split `manifest.tsv` needs no rewrite (its `filename`
 column is a bare basename the registry joins at read time). `kaggle/dist/` is
-git-ignored. Full runbook, including the notebook cells, is `kaggle/README.md`;
-`--resume checkpoints/mms/vNNN` (not `-continue`) is what carries optimizer,
-scheduler, epoch and RNG state across.
+git-ignored. Full runbook, including the notebook cells, is `kaggle/README.md`.
+The first Kaggle run must be `-continue -c checkpoints/mms` (v004 is a 26-token
+word model; FLEURS needs 81, and only the `from_checkpoint` path grows a
+vocabulary). `--resume checkpoints/mms/vNNN` — which carries optimizer,
+scheduler, epoch and RNG across — only applies once a FLEURS version exists.
 
 ## Gotchas (all hit in practice)
 
